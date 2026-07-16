@@ -6,17 +6,17 @@ Sortable, filterable data table that stays fast at 5k–50k rows: **memoized row
 
 ### Functional
 
-- Columns with header labels
-- Client-side sort (click header toggles asc/desc/none)
-- Global text filter (and optional per-column filter)
-- Row selection (optional checkbox)
-- Controlled or uncontrolled data prop
+- Columns with headers
+- Client-side sort (header toggles asc/desc/none)
+- Global text filter
+- Optional row selection
+- Controlled `rows` prop
 
 ### Non-functional
 
-- Typing in filter shouldn’t remount every cell wastefully
-- Sort/filter O(n log n) / O(n) acceptable for mid size; virtualize beyond ~500–1000 DOM rows
-- Keyboard: sortable headers are buttons
+- Filter typing shouldn’t remount every cell wastefully
+- Virtualize beyond ~500–1000 DOM rows
+- Sortable headers are buttons (keyboard)
 
 ### Clarify
 
@@ -33,13 +33,13 @@ flowchart TB
   Sort --> View[visible rows]
   View --> Virtual[optional window]
   Virtual --> Row[memo TableRow]
-  UI[filter input / headers] --> Filter
+  UI[filter / headers] --> Filter
   UI --> Sort
 ```
 
 ```mermaid
 flowchart LR
-  Keystroke[filter keystroke] --> Deferred[useDeferredValue]
+  Keystroke[filter] --> Deferred[useDeferredValue]
   Deferred --> Derive[filtered+sorted]
   Derive --> Render[virtual window]
 ```
@@ -55,7 +55,6 @@ import {
   useState,
   type ReactNode,
 } from 'react'
-// VirtualList: copy from /machine-coding/04-virtual-list (same package in an interview pad)
 
 export type Column<T> = {
   id: string
@@ -76,13 +75,39 @@ function defaultCompare(a: unknown, b: unknown): number {
   return String(a).localeCompare(String(b), undefined, { numeric: true })
 }
 
-export type TableProps<T> = {
-  rows: T[]
-  columns: Column<T>[]
-  getRowId: (row: T) => string
-  height?: number
-  rowHeight?: number
-  virtualize?: boolean
+function VirtualWindow<T>({
+  items,
+  height,
+  rowHeight,
+  getKey,
+  renderRow,
+  overscan = 6,
+}: {
+  items: T[]
+  height: number
+  rowHeight: number
+  getKey: (row: T) => string
+  renderRow: (row: T) => ReactNode
+  overscan?: number
+}) {
+  const [scrollTop, setScrollTop] = useState(0)
+  const start = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan)
+  const end = Math.min(items.length, start + Math.ceil(height / rowHeight) + overscan * 2)
+  const offsetY = start * rowHeight
+  return (
+    <div
+      style={{ height, overflow: 'auto', position: 'relative' }}
+      onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
+    >
+      <div style={{ height: items.length * rowHeight, position: 'relative' }}>
+        <div style={{ transform: `translateY(${offsetY}px)` }}>
+          {items.slice(start, end).map((row) => (
+            <div key={getKey(row)}>{renderRow(row)}</div>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
 }
 
 export function OptimizedTable<T>({
@@ -92,7 +117,14 @@ export function OptimizedTable<T>({
   height = 400,
   rowHeight = 40,
   virtualize = true,
-}: TableProps<T>) {
+}: {
+  rows: T[]
+  columns: Column<T>[]
+  getRowId: (row: T) => string
+  height?: number
+  rowHeight?: number
+  virtualize?: boolean
+}) {
   const [filter, setFilter] = useState('')
   const deferredFilter = useDeferredValue(filter)
   const [sort, setSort] = useState<SortState>(null)
@@ -103,21 +135,16 @@ export function OptimizedTable<T>({
     let list = rows
     if (q) {
       list = rows.filter((row) =>
-        columns.some((c) =>
-          String(c.accessor(row) ?? '')
-            .toLowerCase()
-            .includes(q),
-        ),
+        columns.some((c) => String(c.accessor(row) ?? '').toLowerCase().includes(q)),
       )
     }
     if (sort) {
       const col = columns.find((c) => c.id === sort.id)
       if (col) {
         const dir = sort.dir === 'asc' ? 1 : -1
-        list = list.slice().sort((ra, rb) => {
-          const cmp = defaultCompare(col.accessor(ra), col.accessor(rb))
-          return cmp * dir
-        })
+        list = list.slice().sort(
+          (ra, rb) => defaultCompare(col.accessor(ra), col.accessor(rb)) * dir,
+        )
       }
     }
     return list
@@ -140,12 +167,14 @@ export function OptimizedTable<T>({
     })
   }
 
+  const gridCols = `32px ${columns.map((c) => `${c.width ?? 120}px`).join(' ')}`
+
   const header = (
     <div
       role="row"
       style={{
         display: 'grid',
-        gridTemplateColumns: `32px ${columns.map((c) => `${c.width ?? 120}px`).join(' ')}`,
+        gridTemplateColumns: gridCols,
         position: 'sticky',
         top: 0,
         background: '#fafafa',
@@ -179,6 +208,7 @@ export function OptimizedTable<T>({
       selected={selected.has(getRowId(row))}
       onToggle={toggleRow}
       rowHeight={rowHeight}
+      gridCols={gridCols}
     />
   )
 
@@ -186,22 +216,17 @@ export function OptimizedTable<T>({
     <div>
       <label>
         Filter{' '}
-        <input
-          value={filter}
-          onChange={(e) => setFilter(e.target.value)}
-          placeholder="Search…"
-        />
+        <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Search…" />
       </label>
       <div style={{ marginTop: 8, border: '1px solid #ddd' }}>
         {header}
         {virtualize ? (
-          /* Use VirtualList from 04-virtual-list — same props shape */
           <VirtualWindow
             items={visible}
             height={height}
             rowHeight={rowHeight}
             getKey={getRowId}
-            renderRow={(row) => renderRow(row)}
+            renderRow={renderRow}
           />
         ) : (
           <div style={{ maxHeight: height, overflow: 'auto' }}>
@@ -220,13 +245,14 @@ export function OptimizedTable<T>({
   )
 }
 
-const TableRow = memo(function TableRow<T>({
+const TableRow = memo(function TableRowInner<T>({
   row,
   columns,
   rowId,
   selected,
   onToggle,
   rowHeight,
+  gridCols,
 }: {
   row: T
   columns: Column<T>[]
@@ -234,13 +260,14 @@ const TableRow = memo(function TableRow<T>({
   selected: boolean
   onToggle: (id: string) => void
   rowHeight: number
+  gridCols: string
 }) {
   return (
     <div
       role="row"
       style={{
         display: 'grid',
-        gridTemplateColumns: `32px ${columns.map((c) => `${c.width ?? 120}px`).join(' ')}`,
+        gridTemplateColumns: gridCols,
         height: rowHeight,
         alignItems: 'center',
         borderBottom: '1px solid #f0f0f0',
@@ -260,16 +287,15 @@ const TableRow = memo(function TableRow<T>({
       ))}
     </div>
   )
-}) as <T>(props: {
+}) as <T>(p: {
   row: T
   columns: Column<T>[]
   rowId: string
   selected: boolean
   onToggle: (id: string) => void
   rowHeight: number
-}) => JSX.Element
-
-// ─── Demo ────────────────────────────────────────────────────────────
+  gridCols: string
+}) => React.ReactElement
 
 type User = { id: string; name: string; age: number; role: string }
 
@@ -294,110 +320,56 @@ export function UsersTableDemo() {
     [],
   )
 
-  return (
-    <OptimizedTable
-      rows={rows}
-      columns={columns}
-      getRowId={(r) => r.id}
-      virtualize
-    />
-  )
-}
-```
-
-### Minimal `VirtualWindow` (fixed height)
-
-```tsx
-function VirtualWindow<T>({
-  items,
-  height,
-  rowHeight,
-  getKey,
-  renderRow,
-  overscan = 6,
-}: {
-  items: T[]
-  height: number
-  rowHeight: number
-  getKey: (row: T) => string
-  renderRow: (row: T) => ReactNode
-  overscan?: number
-}) {
-  const [scrollTop, setScrollTop] = useState(0)
-  const start = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan)
-  const end = Math.min(items.length, start + Math.ceil(height / rowHeight) + overscan * 2)
-  const offsetY = start * rowHeight
-  return (
-    <div
-      style={{ height, overflow: 'auto', position: 'relative' }}
-      onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
-    >
-      <div style={{ height: items.length * rowHeight }}>
-        <div style={{ transform: `translateY(${offsetY}px)` }}>
-          {items.slice(start, end).map((row) => (
-            <div key={getKey(row)}>{renderRow(row)}</div>
-          ))}
-        </div>
-      </div>
-    </div>
-  )
+  return <OptimizedTable rows={rows} columns={columns} getRowId={(r) => r.id} virtualize />
 }
 ```
 
 ### Server-driven variant
 
-```ts
-// Debounce filter → fetch `/api/users?q=&sort=&cursor=`
-// Don’t sort 1M rows on the client.
-```
+Debounce filter → `GET /api/users?q=&sort=&cursor=` — don’t sort 1M rows on the client.
 
 ## Edge cases
 
 | Case | Handling |
 | --- | --- |
-| Empty data / no matches | Empty state row |
-| Null/undefined cells | `defaultCompare` nulls-last/first |
-| Stable sort needed | Tie-break by `getRowId` |
-| Columns identity change every render | `useMemo` columns in parent |
-| Selection + filter | Selection by id survives filter |
-| `memo` row still re-renders | Ensure `columns` / `onToggle` stable |
-| Extremely wide tables | Horizontal virtualize / sticky first col |
+| Empty / no matches | Empty state |
+| Null cells | `defaultCompare` nulls first |
+| Unstable `columns` identity | `useMemo` in parent |
+| Selection + filter | Select by id |
+| `memo` still re-renders | Stabilize callbacks / columns |
 
 ## Follow-up interview questions
 
-1. When do you move sort/filter to the server?
-2. Why `useDeferredValue` on filter text?
-3. How does TanStack Table separate headless state from UI?
-4. Sticky header + virtualization interaction?
-5. How to avoid re-rendering all rows on select-one?
-6. Controlled selection vs internal Set?
-7. What breaks if `getRowId` is unstable?
-8. CSV export — sync vs worker?
+1. When move sort/filter to server?
+2. Why `useDeferredValue`?
+3. TanStack Table headless model?
+4. Sticky header + virtualization?
+5. Avoid re-render all rows on select-one?
+6. Unstable `getRowId` bugs?
+7. CSV export — main thread vs worker?
+8. Frozen columns approach?
 
 ## Common mistakes
 
 | Mistake | Fix |
 | --- | --- |
-| Sort in render without memo | `useMemo` on derived rows |
-| Inline `columns={[{...}]}` | Recreates cells every render |
-| Rendering 10k DOM `<tr>` | Virtualize |
-| Mutating `rows.sort()` | Copy then sort |
+| Sort in render without memo | `useMemo` derived rows |
+| Inline `columns={[{…}]}` | Recreates cells |
+| 10k DOM `<tr>` | Virtualize |
+| Mutate `rows.sort()` | Copy then sort |
 | Index keys | Stable ids |
-| Heavy cell components without memo | `memo` + stable props |
 
 ## Trade-offs
 
 | Choice | Pros | Cons |
 | --- | --- | --- |
-| Client sort/filter | Instant, offline | Memory / CPU ceiling |
-| Server page | Scales | Latency; harder UX |
-| Full virtualize | Smooth at 50k | Fixed column width math |
-| Canvas grid (AG Grid etc.) | Extreme perf | Heavy dependency |
+| Client sort/filter | Instant | CPU/memory ceiling |
+| Server page | Scales | Latency |
+| Full virtualize | Smooth at 50k | Width math harder |
+| Canvas grid libs | Extreme perf | Heavy deps |
 
-**Interview close:** “Derive filtered+sorted immutably with memoization, defer expensive filter input, virtualize rows, memoize row components with stable ids — measure before over-optimizing.”
+**Interview close:** “Derive filtered+sorted with memoization, defer filter input, virtualize rows, memoize row components with stable ids.”
 
 ## Related
 
-- [Virtual list](/machine-coding/04-virtual-list)
-- Dashboard design: [FE Dashboard](/frontend-system-design/06-dashboard)
-- React perf: [Memoization](/react/09-memoization)
+- [Virtual list](/machine-coding/04-virtual-list) · [FE Dashboard](/frontend-system-design/06-dashboard)

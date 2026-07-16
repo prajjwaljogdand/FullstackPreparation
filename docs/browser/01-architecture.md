@@ -1,249 +1,600 @@
 # Browser Architecture
 
-Modern browsers are multi-process systems. Chrome/Edge (Blink + V8), Firefox (Gecko + SpiderMonkey), and Safari (WebKit + JavaScriptCore) share the same conceptual split: a privileged **browser process**, per-site **renderer processes**, a **GPU process**, and **network / utility** processes. Site Isolation and Spectre defenses made this mandatory rather than optional.
+This chapter teaches how a modern browser is built from scratch. You do not need to already know processes, sandboxes, Site Isolation, or Chromium’s process model. By the end you should be able to explain **why a browser uses many processes**, **what the browser / renderer / GPU / network processes do**, **what a “tab” really is**, and **why one compromised page should not read another site’s memory**.
 
-Related: [JS Event Loop](/javascript/10-event-loop) · [JS Browser APIs](/javascript/19-browser-apis) · [React Fiber](/react/01-fiber)
+Related later: [Rendering Pipeline](/browser/02-rendering-pipeline) · [Browser Event Loop](/browser/03-event-loop) · [JS Event Loop](/javascript/10-event-loop) · [Security](/javascript/21-security)
 
-## Process model (Chromium-shaped)
+---
 
-| Process | Privilege | Responsibility |
-| --- | --- | --- |
-| Browser (main) | High | Tabs UI, navigation, cookie store, permissions, process spawn |
-| Renderer | Sandboxed | Parse HTML/CSS/JS, DOM, layout, paint, V8 isolate |
-| GPU | Restricted | Compositing, WebGL/WebGPU, raster acceleration |
-| Network | Restricted | HTTP stack, cache, sockets, CORS enforcement helpers |
-| Utility | Restricted | Audio decode, PDF, storage backends |
+## 1. Start with a simpler (wrong) picture
 
-```mermaid
-flowchart TB
-  subgraph BrowserProcess["Browser Process"]
-    UI[UI / Tab Strip]
-    Nav[Navigation Controller]
-    Cookie[Cookie Jar]
-  end
-  subgraph Renderers["Renderer Processes (per site-instance)"]
-    R1[Renderer A: example.com]
-    R2[Renderer B: other.com]
-  end
-  GPU[GPU Process]
-  Net[Network Process]
-  UI --> Nav
-  Nav -->|IPC: commit navigation| R1
-  Nav -->|IPC| R2
-  R1 -->|compositor frames| GPU
-  R2 --> GPU
-  R1 -->|resource requests| Net
-  R2 --> Net
-  Net --> Cookie
-```
+When you open a website, it *feels* like one app: address bar, page content, JavaScript running, images appearing. A natural first mental model is:
 
-### Site Isolation
+> “The browser is one program. It downloads HTML, draws the page, and runs JS.”
 
-A **site** ≈ scheme + registrable domain (`https://a.example.com` and `https://b.example.com` can share; `https://evil.com` cannot). Cross-origin iframes often get their own process. Goal: steal memory across origins even if the renderer is compromised (Spectre-class).
+That picture is good enough to *use* a browser. It is **not** how modern browsers are engineered.
 
-**Interview hook:** “Why not one process per tab?” — Because one tab can embed many origins; process-per-site-instance is the unit that matches the Same-Origin Policy.
+A more accurate first correction:
 
-## Inside a renderer: threads
+> A browser is a **collection of cooperating programs** (processes) that talk to each other. Some are highly privileged. Some are deliberately weak and sandboxed. The page you see is mostly drawn by a sandboxed process that is **not trusted** with your passwords for other sites, your OS files, or other tabs’ memory.
+
+Why bother with that complexity? Because web pages run **untrusted code** (HTML/CSS/JS from strangers). If one bad page could freely touch everything the browser can touch, every ad, iframe, and phishing site would be catastrophic.
 
 ```mermaid
 flowchart LR
-  Main[Main Thread<br/>DOM CSS JS Layout Paint]
-  Comp[Compositor Thread]
-  Raster[Raster Threads]
-  Worker[Web Workers]
-  Main -->|layer tree / damage| Comp
-  Comp --> Raster
-  Worker -.->|postMessage| Main
+  subgraph naive ["Naive model"]
+    One["One process does everything"]
+  end
+  subgraph real ["Real model (simplified)"]
+    BP["Browser process<br/>(trusted UI + policy)"]
+    RP["Renderer process(es)<br/>(sandboxed page)"]
+    NP["Network process"]
+    GP["GPU process"]
+    BP --- RP
+    BP --- NP
+    BP --- GP
+    RP --- NP
+    RP --- GP
+  end
 ```
 
-| Thread | Does | Must not |
+This chapter teaches the real model step by step.
+
+---
+
+## 2. Process, memory, and privilege — plain language first
+
+### 2.1 What a process is
+
+A **process** is an operating-system container for a running program:
+
+- It has its **own memory address space** (by default, process A cannot read process B’s RAM).
+- It has a set of **privileges** (what files, devices, and system calls it may use).
+- It can contain one or more **threads** (concurrent workers *inside* that process that *do* share memory).
+
+So:
+
+| Idea | Shares memory with others of its kind? | Typical isolation |
 | --- | --- | --- |
-| Main | JS, style, layout, paint recording | Block >16ms frames |
-| Compositor | Scroll, CSS transforms/opacity on compositor-only props | Touch DOM |
-| Raster | Tile bitmaps | Run JS |
-| Worker | CPU work off main | DOM access |
+| **Process** | No (separate address spaces) | Strong OS boundary |
+| **Thread** | Yes (same process) | Weak; one bug can corrupt all |
 
-Blink’s **Blink Main** owns the DOM. V8 runs on the same thread for page JS (Workers get their own isolates). Compositor can produce frames while main is busy **only** for properties that don’t need layout (see [Rendering Pipeline](/browser/02-rendering-pipeline)).
+Browsers use **processes** as the main security wall between sites. They use **threads** inside a process for parallelism (layout, compositing, workers) where sharing memory is useful and acceptable.
 
-## Navigation & document lifecycle
+### 2.2 Why isolation matters for the web
 
-1. User / `location` change → browser process decides.
-2. Network process fetches; redirects resolved centrally.
-3. **Commit**: browser process sends the response to a renderer; old document starts unload.
-4. HTML parser builds DOM; speculative parsing + preload scanner run ahead of JS.
-5. `DOMContentLoaded` → resources → `load` → idle → bfcache candidates.
+Imagine two tabs:
+
+1. `https://bank.example` — session cookies, account HTML
+2. `https://evil.example` — attacker’s JS
+
+If both ran in **one** process with shared memory, a bug in the JS engine (or a Spectre-style side channel) could let evil code **read bank memory** even without a classic “hack the OS” exploit. Separating them into different processes makes that much harder: there is no shared heap to snoop.
+
+That is the core *why* behind multi-process browsers.
+
+---
+
+## 3. The four process types you must know
+
+Chromium (Chrome, Edge, many Electron apps) is the clearest teaching model. Firefox and Safari differ in details but share the same *ideas*. Learn Chromium-shaped vocabulary; map other engines later.
+
+### 3.1 Browser process (the trusted coordinator)
+
+The **browser process** (sometimes called the *main* or *browser* process) is the privileged core:
+
+- Owns the **UI chrome**: tab strip, address bar, bookmarks, menus
+- Decides **navigations** (“go to this URL”)
+- Owns sensitive stores: **cookies**, passwords (via OS integration), permissions (“can this site use the camera?”)
+- **Spawns and kills** other processes
+- Enforces high-level **security policy** (which renderer may talk to which origin’s cookies, etc.)
+
+Plain language:
+
+> The browser process is the **manager**. It does not usually parse your page’s DOM or run page JavaScript. It decides *who* is allowed to do *what*, and it shows the window chrome.
+
+### 3.2 Renderer process (where the page lives)
+
+A **renderer process** runs the engine that turns a document into an interactive page:
+
+- Parse HTML → build the **DOM**
+- Parse CSS → build style data
+- Run page **JavaScript** (V8 in Chromium, SpiderMonkey in Firefox, JavaScriptCore in Safari)
+- **Layout** and **paint** recording
+- Talk to the compositor / GPU for frames
+
+Renderers are **sandboxed**: even if attacker JS escapes the JS engine into native code inside the renderer, the OS sandbox tries to limit what that process can do (no free filesystem access, limited syscalls).
+
+Plain language:
+
+> The renderer is the **workshop for one site’s page**. It is powerful for drawing and scripting *that* page, and intentionally weak everywhere else.
+
+### 3.3 GPU process
+
+Drawing modern UIs uses the **GPU** heavily: compositing layers, WebGL/WebGPU, accelerating rasterization.
+
+Putting GPU work in a **separate process** helps:
+
+- Crash isolation (a GPU driver bug need not kill every tab)
+- Privilege separation (GPU access is dangerous; contain it)
+
+The renderer often prepares “display lists” / layer trees; the GPU process helps turn those into **pixels on screen**.
+
+### 3.4 Network process
+
+The **network process** owns much of the HTTP stack:
+
+- DNS lookups (often coordinated with the OS / system resolver)
+- TCP / TLS / HTTP/2 / HTTP/3
+- Disk HTTP cache coordination
+- Many CORS / mixed-content checks at the network boundary
+
+Why separate? Networking touches the outside world and caches; isolating it reduces the blast radius of bugs and keeps cookie attachment policy centralized with the browser process.
+
+```mermaid
+flowchart TB
+  subgraph BrowserProcess["Browser process"]
+    UI["Tab UI / omnibox"]
+    Nav["Navigation / permissions"]
+    Cookies["Cookie jar / credential policy"]
+  end
+  subgraph Renderers["Renderer processes"]
+    R1["Renderer: site A"]
+    R2["Renderer: site B"]
+  end
+  GPU["GPU process"]
+  Net["Network process"]
+  UI --> Nav
+  Nav -->|"commit navigation"| R1
+  Nav --> R2
+  R1 -->|"resource requests"| Net
+  R2 --> Net
+  Net --> Cookies
+  R1 -->|"frames / layers"| GPU
+  R2 --> GPU
+```
+
+| Process | Trust level | Main job |
+| --- | --- | --- |
+| Browser | High | UI, policy, cookies, spawn processes |
+| Renderer | Low (sandboxed) | DOM, CSS, JS, layout, paint |
+| GPU | Restricted | Compositing / GPU APIs |
+| Network | Restricted | Sockets, HTTP, cache plumbing |
+
+There are also **utility** processes (audio, PDF, storage helpers). Treat them as “extra sandboxed helpers” unless an interviewer asks.
+
+---
+
+## 4. What is a “tab”, really?
+
+Users think: **one tab = one page = one process**.
+
+Reality is more precise:
+
+- A **tab** is a **UI concept** in the browser process (a strip entry + a WebContents / browsing context container).
+- Inside a tab you may have:
+  - a top-level document (`https://news.example`)
+  - several **iframes** from other origins (`ads.example`, `widget.example`)
+  - navigations that replace the document over time
+
+Those documents may run in **different renderer processes** even inside one tab.
+
+So:
+
+> A tab is a **user-facing container**. A renderer process is a **security and execution container**. They are not 1:1.
+
+```mermaid
+flowchart TB
+  Tab["Tab UI (browser process)"]
+  Top["Top-level frame: news.example<br/>Renderer P1"]
+  Ad["iframe: ads.example<br/>Renderer P2"]
+  Widget["iframe: pay.example<br/>Renderer P3"]
+  Tab --> Top
+  Tab --> Ad
+  Tab --> Widget
+```
+
+**Interview-ready sentence:** “Tabs are UI; process boundaries follow **site / origin isolation** policy, not the tab strip.”
+
+---
+
+## 5. Site, origin, and Site Isolation
+
+### 5.1 Origin (security unit for the web)
+
+An **origin** is roughly:
+
+```text
+scheme + host + port
+```
+
+Examples:
+
+| URL | Origin |
+| --- | --- |
+| `https://example.com/a` | `https://example.com` (default port 443) |
+| `https://example.com:443/b` | same as above |
+| `http://example.com` | **different** (scheme differs) |
+| `https://api.example.com` | **different** host |
+| `https://example.com:4443` | **different** port |
+
+The **Same-Origin Policy** says: by default, JS in origin A must not freely read origin B’s DOM or credentials. (Networking has extra rules — see [Networking](/browser/05-networking) and [Security](/javascript/21-security).)
+
+### 5.2 “Site” vs “origin” in Chromium language
+
+For **process assignment**, Chromium often talks about a **site** (roughly scheme + registrable domain), which is a coarser bucket than origin. Details evolve, but the teaching point is:
+
+> Related subdomains sometimes used to share a process more readily than completely unrelated domains. Cross-site content is isolated more aggressively.
+
+You do **not** need every Chromium heuristic. You need the *goal*:
+
+### 5.3 Site Isolation — the goal
+
+**Site Isolation** means: put different sites into different renderer processes so that:
+
+1. A compromised renderer for `evil.com` cannot casually read `bank.com`’s memory.
+2. Cross-origin iframes are often out-of-process (**OOPIF** — out-of-process iframe).
+3. Spectre-class speculative-execution attacks become harder across sites because there is no shared process heap.
+
+```mermaid
+flowchart LR
+  subgraph before ["Weaker model"]
+    T1["One renderer<br/>bank + evil iframes"]
+  end
+  subgraph after ["Site Isolation"]
+    B["Renderer: bank.com"]
+    E["Renderer: evil.com"]
+  end
+```
+
+**Why not “one process per tab” as the slogan?** Because one tab embeds many sites. The isolation unit must follow **who owns the content** (site/origin), not the tab chrome.
+
+---
+
+## 6. How processes talk: IPC (without the scary acronym soup)
+
+Processes do not share memory freely. They send **messages** — Inter-Process Communication (**IPC**).
+
+Examples of messages:
+
+- Browser → Renderer: “Commit this navigation; here is the response head / body pipe.”
+- Renderer → Network: “Please fetch `https://cdn.example/app.js`.”
+- Renderer → GPU: “Here is an updated layer tree / frame.”
+- Renderer → Browser: “User clicked; open this popup?” / “Request camera permission.”
+
+Plain language:
+
+> IPC is the **postal** between rooms. The renderer asks; the browser process decides; the network process dials.
+
+If an interviewer asks “where do cookies live?”, a strong answer is: **cookie jar policy is owned with the browser / network side**, not freely readable by every renderer as a big shared global. Renderers get what policy allows for their requests.
+
+---
+
+## 7. Inside one renderer: threads
+
+A renderer process is not single-threaded. Important threads (names vary by engine; concepts transfer):
+
+### 7.1 Main thread (Blink main / UI thread for the page)
+
+On the **main thread** you typically find:
+
+- JavaScript for the page (event handlers, timers callbacks, promises — see [Browser Event Loop](/browser/03-event-loop))
+- DOM mutations
+- Style calculation
+- Layout
+- Paint *recording* (building a display list)
+
+If JS runs for 200ms, **style/layout/paint for that document wait**. That is why long tasks cause jank.
+
+### 7.2 Compositor thread
+
+The **compositor** can often produce frames for certain updates (scrolling, transform/opacity on promoted layers) **without** waiting for the main thread to finish JS — *if* the change does not need layout on the main thread.
+
+This is why “animate `transform`/`opacity`” is taught as cheaper than animating `top`/`width`. Deep dive: [Rendering Pipeline](/browser/02-rendering-pipeline).
+
+### 7.3 Raster threads
+
+**Raster** turns paint records into bitmap tiles (CPU or GPU-assisted). Parallel raster workers help large pages.
+
+### 7.4 Web Workers
+
+A **Worker** is JS on another thread (still usually same renderer process, separate V8 isolate). It cannot touch the DOM. It talks via `postMessage`.
 
 ```ts
-// Document readiness — interview-grade mental model
-type ReadyState = 'loading' | 'interactive' | 'complete'
+// main thread
+const worker = new Worker("/worker.js")
 
-function onReady(fn: () => void): void {
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', fn, { once: true })
+worker.postMessage({ type: "sum", values: [1, 2, 3] })
+
+worker.onmessage = (event: MessageEvent<{ result: number }>) => {
+  console.log(event.data.result)
+}
+```
+
+```ts
+// worker.js
+self.onmessage = (event: MessageEvent<{ type: string; values: number[] }>) => {
+  if (event.data.type === "sum") {
+    const result = event.data.values.reduce((a, b) => a + b, 0)
+    self.postMessage({ result })
+  }
+}
+```
+
+```mermaid
+flowchart LR
+  Main["Main thread<br/>DOM · CSS · JS · Layout · Paint record"]
+  Comp["Compositor thread"]
+  Raster["Raster threads"]
+  Worker["Web Worker(s)"]
+  Main -->|"layer tree / damage"| Comp
+  Comp --> Raster
+  Worker -.->|"postMessage only"| Main
+```
+
+| Thread | Can touch DOM? | Typical work |
+| --- | --- | --- |
+| Main | Yes | JS, style, layout, paint record |
+| Compositor | No | Scroll, composite frames |
+| Raster | No | Bitmap tiles |
+| Worker | No | CPU-heavy JS |
+
+---
+
+## 8. Engines under the hood (names, not trivia)
+
+You will hear product + engine pairs:
+
+| Browser | Rendering engine | JS engine |
+| --- | --- | --- |
+| Chrome / Edge | Blink | V8 |
+| Firefox | Gecko | SpiderMonkey |
+| Safari | WebKit | JavaScriptCore |
+
+For architecture interviews, saying “Blink + V8 in a sandboxed renderer, coordinated by a browser process” is enough. Engine names matter when debugging engine-specific bugs, not when explaining process isolation.
+
+---
+
+## 9. Navigation lifecycle — slow motion
+
+What happens when you type `https://example.com` and press Enter?
+
+### Step 1 — UI event in the browser process
+
+The omnibox lives in the **browser process**. Your keypress is not “JS in a page”; it is browser UI.
+
+### Step 2 — Navigation decision
+
+The browser process starts a **navigation**:
+
+- Resolve whether this is same-document (hash) vs full navigation
+- Pick or create a **renderer** appropriate for the destination site
+- Ask the **network process** to fetch
+
+### Step 3 — Network fetch
+
+Network process: DNS → TCP → TLS → HTTP (taught in [Networking](/browser/05-networking)). Redirects are often followed under browser/network control.
+
+### Step 4 — Commit
+
+When headers look acceptable, the browser process **commits** the navigation to a renderer:
+
+- Old document begins unload / may enter back-forward cache in some cases
+- New document becomes the active document for that frame
+- HTML bytes start flowing to the parser
+
+### Step 5 — Parse and run
+
+Renderer:
+
+1. HTML parser builds DOM
+2. Preload scanner may notice `<script src>` / `<link rel=stylesheet>` early and ask network for them
+3. CSS applies; JS may run and block parser depending on script attributes
+4. First paint opportunities appear when enough of the tree exists (see rendering chapter)
+
+### Step 6 — Load events
+
+Rough readiness ladder:
+
+| `document.readyState` | Meaning (practical) |
+| --- | --- |
+| `loading` | Still parsing |
+| `interactive` | DOM parsed; `DOMContentLoaded` soon/fired |
+| `complete` | Subresources done enough for `load` |
+
+```ts
+type ReadyState = "loading" | "interactive" | "complete"
+
+function whenDomReady(fn: () => void): void {
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", fn, { once: true })
   } else {
-    // interactive | complete — DOM already parsed
-    queueMicrotask(fn)
+    fn()
   }
 }
 
-// Navigation Timing Level 2 (high-res)
-function ttfb(): number | undefined {
-  const [nav] = performance.getEntriesByType('navigation') as PerformanceNavigationTiming[]
-  return nav ? nav.responseStart - nav.requestStart : undefined
+function whenFullyLoaded(fn: () => void): void {
+  if (document.readyState === "complete") {
+    fn()
+  } else {
+    window.addEventListener("load", fn, { once: true })
+  }
 }
 ```
-
-Cross-link: parsing blocking scripts ↔ [JS Modules](/javascript/13-modules) and [Networking](/browser/05-networking).
-
-## IPC & security boundary
-
-Renderers talk to the browser process via Mojo/IPC. DOM never directly opens raw sockets; `fetch` / XHR are mediated. Cookies with `HttpOnly` never enter JS heaps. Permissions (camera, geolocation) are gated in the browser process UI.
 
 ```mermaid
 sequenceDiagram
-  participant Page as Renderer JS
-  participant Blink
-  participant Browser as Browser Process
-  participant Net as Network Process
-  Page->>Blink: fetch('/api')
-  Blink->>Browser: IPC resource request
-  Browser->>Net: issue HTTP
-  Net-->>Browser: response
-  Browser-->>Blink: body / headers (filtered)
-  Blink-->>Page: Response
+  participant User
+  participant Browser as Browser process
+  participant Net as Network process
+  participant Rend as Renderer process
+  User->>Browser: Enter URL
+  Browser->>Net: Fetch
+  Net-->>Browser: Response
+  Browser->>Rend: Commit navigation
+  Rend->>Rend: Parse DOM / CSS / JS
+  Rend->>Browser: Paint frames via GPU path
 ```
 
-## Multi-process vs single-process trade-off table
+---
 
-| Model | Crash isolation | Memory | IPC cost | Security |
-| --- | --- | --- | --- | --- |
-| Single process (old) | None | Low | Zero | Weak |
-| Process per tab | Good | High | Medium | Medium |
-| Site Isolation | Best | Highest | Higher | Strongest |
+## 10. Sandboxing — what “untrusted renderer” means
+
+A sandbox is a set of **OS restrictions** on a process:
+
+- Cannot open arbitrary files
+- Cannot make arbitrary network connections without going through brokered APIs
+- Cannot install kernel drivers, etc.
+
+JS running in the page is therefore **double-wrapped**:
+
+1. Language/runtime rules (Same-Origin Policy, CORS, etc.)
+2. Process sandbox (even native code escape is limited)
+
+No sandbox is perfect. Defense in depth = **SOP + CORS + CSP + process isolation + permission prompts**. See [JS Security](/javascript/21-security).
+
+---
+
+## 11. Memory and crashes — practical consequences
+
+Because tabs/sites are split across processes:
+
+- **One renderer crash** often shows a sad tab, not a dead browser.
+- Memory cost rises: each process has base overhead (isolates, heaps).
+- DevTools “Memory” for a page is mostly **that renderer**, not the whole browser.
+
+When an interviewer asks “why multi-process if it uses more RAM?”, answer:
+
+> Security and reliability. The web runs adversarial code; isolation is worth the memory.
+
+---
+
+## 12. Worked mental model — three scenarios
+
+### Scenario A: Two tabs, two sites
+
+- Tab 1: `https://mail.example`
+- Tab 2: `https://shop.example`
+
+Expect **two renderer processes** (plus shared browser/GPU/network). Cookies for each site attach under policy when each renderer’s requests go out.
+
+### Scenario B: One tab, cross-origin iframe
+
+- Top: `https://news.example`
+- iframe: `https://ads.example`
+
+Often **two renderers** (OOPIF). The ad’s JS should not read the news DOM. Parent/iframe talk only via allowed channels (`postMessage`, etc.).
+
+### Scenario C: `about:blank` popup then navigate
+
+Popups and `window.open` still involve the **browser process** for opener relationships and permission. Cross-origin windows cannot read each other’s DOM.
+
+```ts
+const win = window.open("https://other.example/app")
+// If cross-origin, win.document is not readable — SOP
+win?.postMessage({ hello: true }, "https://other.example")
+```
+
+---
+
+## 13. How this connects to JS you write
+
+You rarely spawn processes yourself from page JS. But architecture explains symptoms:
+
+| Symptom | Architectural reason |
+| --- | --- |
+| Page freeze, tab still scrollable sometimes | Main thread busy; compositor may still scroll |
+| iframe feels “separate” | May be another process + SOP |
+| Chrome task manager shows many processes | Site Isolation + utility processes |
+| `alert()` freezes the page | Modal dialog blocks that page’s JS; browser UI may still work |
+
+Deep related chapters:
+
+- Scheduling of JS vs paint: [Browser Event Loop](/browser/03-event-loop), [JS Event Loop](/javascript/10-event-loop)
+- Pixels: [Rendering Pipeline](/browser/02-rendering-pipeline), [JS Rendering](/javascript/20-rendering)
+
+---
+
+## 14. Minimal TypeScript map of responsibilities
+
+This is not a real browser API — it is a teaching model of who owns what:
+
+```ts
+/** Teaching model only — not a real browser API */
+type ProcessId = string
+
+interface BrowserProcess {
+  openTab(url: string): TabId
+  navigate(tab: TabId, url: string): Promise<void>
+  cookieJar: Map<string, string>
+  spawnRenderer(site: string): ProcessId
+}
+
+interface RendererProcess {
+  site: string
+  document: unknown // DOM
+  runJs(source: string): void
+  requestResource(url: string): Promise<ArrayBuffer>
+}
+
+interface NetworkProcess {
+  fetch(
+    url: string,
+    credentialsPolicy: "omit" | "same-origin" | "include",
+  ): Promise<Response>
+}
+
+type TabId = string
+```
+
+Read it as: **page JS lives in `RendererProcess`**; **navigation policy and cookies** lean on `BrowserProcess` + `NetworkProcess`.
+
+---
 
 ## Interview Questions
 
-**Q1. What runs in the browser process vs the renderer?**  
-Browser: chrome UI, navigation policy, cookie database, process management, some permission prompts. Renderer: DOM, CSSOM, layout, paint, JS execution for that site-instance. Network/GPU are separate helpers.
+### Q1. Why are modern browsers multi-process?
+**Expected:** To isolate untrusted site code for security (especially Spectre-class / renderer compromise) and to improve reliability (one crash does not kill the whole browser).  
+**Common wrong:** “Only for speed” / “One process per tab is the full story.”  
+**Follow-ups:** What is Site Isolation? What runs in the browser process vs renderer?
 
-**Q2. Can two tabs of the same origin share a process?**  
-Often yes (same site-instance / browsing instance heuristics). Not guaranteed across all browsers/versions; treat as implementation detail. Cross-origin iframes may still be out-of-process.
+### Q2. What is the difference between a tab and a renderer process?
+**Expected:** A tab is UI in the browser process; a renderer is a sandboxed execution environment. One tab can contain multiple renderers (cross-origin iframes).  
+**Common wrong:** “Always exactly one process per tab.”  
+**Follow-ups:** What is an OOPIF?
 
-**Q3. Why can CSS `transform` scroll smoothly while JS is busy?**  
-Compositor thread owns scroll and can animate compositor-friendly properties without waiting on main-thread layout. Heavy JS blocks main → style/layout/paint stall, but existing compositor animations may continue.
+### Q3. What does the GPU process do?
+**Expected:** Helps composite layers / accelerate raster and graphics APIs so frames reach the screen, isolated from renderers and the browser process.  
+**Common wrong:** “It runs all JavaScript.”  
+**Follow-ups:** Why can scrolling sometimes work while JS is busy?
 
-**Q4. What is a browsing context?**  
-A unit that displays a document: window, tab, iframe, or nested worker-like contexts. Has session history, `document`, `window`. Related to [JS `this` / window](/javascript/06-this).
+### Q4. Where do cookies live, and can page JS read all of them?
+**Expected:** Cookie storage/policy is coordinated by privileged browser/network code. Page JS can read only non-HttpOnly cookies for its document’s origin via `document.cookie`, not arbitrary other sites’ cookies.  
+**Common wrong:** “Cookies are just variables in the renderer heap shared by all tabs.”  
+**Follow-ups:** What does `HttpOnly` change?
 
-**Q5. How does OOPIF (out-of-process iframe) change `postMessage`?**  
-API unchanged; messages cross process boundaries via IPC. Structured clone still applies; SharedArrayBuffer needs cross-origin isolation.
+### Q5. What is Site Isolation trying to prevent?
+**Expected:** Cross-site data theft via renderer compromise or speculative-execution side channels by putting sites in different processes.  
+**Common wrong:** “It replaces the Same-Origin Policy.” (It *reinforces* it at the OS level.)  
+**Follow-ups:** How does this interact with cross-origin iframes?
+
+### Q6. Main thread vs compositor thread — why care?
+**Expected:** Main thread runs JS/layout/paint recording; compositor can update some frames independently. Long main-thread tasks cause jank; compositor-friendly animations hurt less.  
+**Common wrong:** “All drawing waits for every `setTimeout`.”  
+**Follow-ups:** Which CSS properties tend to be compositor-friendly?
 
 ## Common Mistakes
 
-- Assuming “the browser” is one thread — blaming “the browser is slow” without distinguishing main vs compositor vs network.
-- Thinking Web Workers share the DOM — they share nothing but message ports / optionally SAB.
-- Confusing **origin** (`https://app.com:443`) with **site** (`https://app.com`) with **registrable domain**.
-- Believing `localStorage` is in the renderer only — backed by browser-process storage; quota and eviction are cross-tab.
-- Ignoring that extensions and DevTools add processes/overhead in profiles.
+- Equating **tab** with **process** in every explanation.
+- Saying the **browser process runs page JavaScript**.
+- Forgetting that **iframes** can be out-of-process.
+- Treating sandbox as “JS cannot have bugs” — sandbox limits *damage after escape*, it does not remove SOP needs.
+- Ignoring memory overhead when praising multi-process (acknowledge the trade-off).
+- Mixing up **origin** (SOP unit) and **site** (process-assignment approximation) without saying you are simplifying.
 
-## Trade-offs
+## Trade-offs / Production Notes
 
-| Choice | Win | Cost |
-| --- | --- | --- |
-| Site Isolation | Spectre resistance, crash isolation | RAM (hundreds of MB per heavy site) |
-| Main-thread JS frameworks | Simple mental model | Contends with layout/paint — see [React concurrent](/react/04-concurrent) |
-| Offloading to Worker | Smooth input | Serialization cost, no DOM |
-| Compositor-only animations | 60fps under JS load | Limited property set; layout-inducing props force main |
-
-**Senior takeaway:** Architecture interview answers should name **processes**, **threads**, and **which queue/thread your bug blocks** — then map that to user-visible jank, security, or memory.
-
-## Deep dive — Blink + V8 binding
-
-DOM objects are C++ (Blink). JS sees **wrapper objects** in V8. The binding layer maps `element.innerHTML = …` to C++ setters. When a node is GC’d from JS but still in the tree, Blink keeps it; when removed from the tree but JS holds a reference, both stay alive ([Memory](/browser/07-memory-gc)).
-
-```ts
-// Wrapper identity: same node → same JS object in a realm
-const a = document.body
-const b = document.querySelector('body')
-console.log(a === b) // true — identity via wrapper map
-```
-
-Cross-realm (iframe) wrappers differ: `iframe.contentDocument.body !==` parent’s view of the same C++ node as a shared object — separate realms, `postMessage` to communicate ([Security](/browser/06-security)).
-
-## Deep dive — scheduling & priorities
-
-Chromium’s scheduler prioritizes input > rendering > default idle. Long tasks delay input → INP regression. `scheduler.postTask(fn, { priority: 'user-blocking' | 'user-visible' | 'background' })` (where available) expresses intent; React 18+ aligns with this via cooperative yielding ([React concurrent](/react/04-concurrent)).
-
-```ts
-type Priority = 'user-blocking' | 'user-visible' | 'background'
-
-async function postTask(priority: Priority, fn: () => void): Promise<void> {
-  const sch = (globalThis as unknown as {
-    scheduler?: { postTask: (f: () => void, o: { priority: Priority }) => Promise<void> }
-  }).scheduler
-  if (sch?.postTask) await sch.postTask(fn, { priority })
-  else fn()
-}
-```
-
-## Process vs thread interview script
-
-1. Tab crash kills renderer, not whole browser → process isolation.  
-2. Heavy canvas uses GPU process → compositor/GPU path.  
-3. `fetch` goes Network process → cookies applied with browser-process policy.  
-4. Extension background may be another process → don’t assume one heap.
-
-## Extra Q&A
-
-**Q6. What is a Site Instance?**  
-Chromium grouping of same-site frames that can share a renderer. Different sites → different instances/processes under Site Isolation.
-
-**Q7. Does `iframe` always get its own process?**  
-Cross-site often yes (OOPIF). Same-site may share. Never rely on process identity for security — rely on SOP.
-
-**Q8. Where do service workers run?**  
-Separate worker thread/process context owned by the browser; can wake without a page. Storage/cache shared per origin rules ([Storage](/browser/08-storage)).
-
-**Q9. How does DevTools attach?**  
-Debugging protocol (CDP) talks to browser/renderer targets — itself adds overhead; measure perf in clean profiles.
-
-**Q10. Memory pressure kill?**  
-OS may discard renderer processes; tabs reload on focus. Distinguish from JS heap OOM inside a surviving renderer.
-
-
-## Worked example — diagnosing “UI freezes when uploading”
-
-1. Performance panel: long task on main during `FileReader` sync read → move to Worker / stream.
-2. Network process fine; renderer main blocked → [Event Loop](/browser/03-event-loop).
-3. Compositor still scrolls → confirms main-only jank ([Architecture](/browser/01-architecture) threads).
-4. After fix, INP on cancel button recovers ([Optimization](/browser/09-optimization)).
-
-```ts
-async function hashFile(file: File): Promise<string> {
-  const buf = await file.arrayBuffer() // async; still main-thread CPU for digest
-  const hash = await crypto.subtle.digest('SHA-256', buf)
-  return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, '0')).join('')
-}
-// For multi-MB files, transfer ArrayBuffer to Worker for digest
-```
-
-## Comparison — Chrome vs Safari vs Firefox (interview nuance)
-
-| Concern | Chromium | WebKit/Safari | Gecko/Firefox |
-| --- | --- | --- | --- |
-| Site Isolation | Strong | Different process model | Improving |
-| bfcache | Aggressive | Strong historically | Good |
-| `scheduler` APIs | Ahead | Partial | Partial |
-| Storage partitioning | Yes | ITP pioneer | Tracking protection |
-
-Don’t claim engine internals identical — cite behavior + MDN, verify on target browsers.
-
-## Glossary
-
-| Term | Definition |
-| --- | --- |
-| Renderer | Sandboxed process running Blink + V8 for a site-instance |
-| OOPIF | Out-of-process iframe |
-| Mojo | Chromium IPC system |
-| Isolate | V8 heap/instance |
-| Compositor frame | Layer tree snapshot presented to screen |
+- **More processes ⇒ more RAM**, better isolation and crash containment. Mobile browsers tune aggressiveness differently than desktop.
+- **Electron / CEF** apps inherit Chromium’s model — a heavy “web app desktop shell” is multiple processes whether you notice or not.
+- When debugging performance, use the browser’s **task manager** + Performance panel: confirm whether jank is main-thread JS, layout, or GPU.
+- Security reviews should assume a **compromised renderer** and ask what remains protected (cookies with right flags, other processes, OS secrets).
+- Related reading paths: [Rendering Pipeline](/browser/02-rendering-pipeline) · [Networking](/browser/05-networking) · [JS Security](/javascript/21-security) · [JS Event Loop](/javascript/10-event-loop)

@@ -8,20 +8,20 @@ Multi-file upload with progress, abort, concurrency limits, and retries. Tests a
 
 - Select files via input / drag-drop zone
 - Validate type + max size client-side
-- Upload with progress (`XMLHttpRequest` or `fetch` + ReadableStream — XHR easiest for progress)
+- Upload with progress (XHR easiest)
 - Cancel in-flight upload
 - Retry failed files
-- Optional: multi-file queue with max concurrency
+- Queue with max concurrency
 
 ### Non-functional
 
-- Don’t block UI thread on large files
-- Clear per-file status: queued / uploading / done / error / aborted
-- Memory: avoid reading entire huge file into JS string
+- Don’t block UI on large files
+- Per-file status: queued / uploading / done / error / aborted
+- Avoid reading entire huge files into JS strings
 
 ### Clarify
 
-- Multipart form vs direct-to-S3 presigned PUT?
+- Multipart vs presigned S3 PUT?
 - Chunked / resumable (tus)?
 - Image compression / preview?
 
@@ -30,8 +30,8 @@ Multi-file upload with progress, abort, concurrency limits, and retries. Tests a
 ```mermaid
 flowchart TB
   Input[File input / dropzone] --> Queue[Upload queue]
-  Queue -->|semaphore n=3| Worker[Upload worker]
-  Worker -->|XHR PUT/POST| API
+  Queue -->|semaphore n| Worker[Upload worker]
+  Worker -->|XHR POST| API
   Worker --> Progress[per-file %]
   UI[Status list] --> Queue
   UI -->|abort| Worker
@@ -46,12 +46,12 @@ sequenceDiagram
   U->>Q: add files
   Q->>X: start <= concurrency
   X->>S: POST multipart
-  S-->>X: progress events
+  S-->>X: progress
   X-->>Q: update %
   alt success
     X-->>Q: done + url
   else fail
-    X-->>Q: error; allow retry
+    X-->>Q: error; retry
   end
 ```
 
@@ -59,13 +59,7 @@ sequenceDiagram
 
 ```tsx
 // file-upload.tsx
-import {
-  useCallback,
-  useRef,
-  useState,
-  type ChangeEvent,
-  type DragEvent,
-} from 'react'
+import { useCallback, useRef, useState, type ChangeEvent, type DragEvent } from 'react'
 
 export type UploadStatus = 'queued' | 'uploading' | 'done' | 'error' | 'aborted'
 
@@ -73,7 +67,7 @@ export type UploadItem = {
   id: string
   file: File
   status: UploadStatus
-  progress: number // 0–100
+  progress: number
   error?: string
   url?: string
 }
@@ -82,7 +76,7 @@ type Options = {
   endpoint: string
   concurrency?: number
   maxBytes?: number
-  accept?: string[] // mime prefixes e.g. ['image/', 'application/pdf']
+  accept?: string[]
 }
 
 function uid() {
@@ -107,25 +101,19 @@ function uploadWithProgress(
     signal.addEventListener('abort', onAbort)
 
     xhr.upload.onprogress = (e) => {
-      if (!e.lengthComputable) return
-      onProgress(Math.round((100 * e.loaded) / e.total))
+      if (e.lengthComputable) onProgress(Math.round((100 * e.loaded) / e.total))
     }
 
     xhr.onload = () => {
       signal.removeEventListener('abort', onAbort)
       if (xhr.status >= 200 && xhr.status < 300) {
-        const body = xhr.response ?? {}
-        resolve({ url: body.url ?? endpoint })
-      } else {
-        reject(new Error(`HTTP ${xhr.status}`))
-      }
+        resolve({ url: (xhr.response?.url as string) ?? endpoint })
+      } else reject(new Error(`HTTP ${xhr.status}`))
     }
-
     xhr.onerror = () => {
       signal.removeEventListener('abort', onAbort)
       reject(new Error('Network error'))
     }
-
     xhr.onabort = () => {
       signal.removeEventListener('abort', onAbort)
       reject(new DOMException('Aborted', 'AbortError'))
@@ -163,8 +151,7 @@ export function useUploadQueue(opts: Options) {
 
   const release = () => {
     running.current--
-    const next = waiters.current.shift()
-    if (next) next()
+    waiters.current.shift()?.()
   }
 
   const runOne = async (item: UploadItem) => {
@@ -198,7 +185,7 @@ export function useUploadQueue(opts: Options) {
 
   const validate = (file: File): string | null => {
     if (file.size > maxBytes) return `Max size ${maxBytes} bytes`
-    if (accept && accept.length > 0) {
+    if (accept?.length) {
       const ok = accept.some(
         (a) => file.type === a || (a.endsWith('/') && file.type.startsWith(a)),
       )
@@ -209,35 +196,25 @@ export function useUploadQueue(opts: Options) {
 
   const enqueue = useCallback(
     (files: FileList | File[]) => {
-      const list = Array.from(files)
       const accepted: UploadItem[] = []
-      for (const file of list) {
+      for (const file of Array.from(files)) {
         const err = validate(file)
         const id = uid()
-        if (err) {
-          accepted.push({
-            id,
-            file,
-            status: 'error',
-            progress: 0,
-            error: err,
-          })
-        } else {
-          accepted.push({ id, file, status: 'queued', progress: 0 })
-        }
+        accepted.push(
+          err
+            ? { id, file, status: 'error', progress: 0, error: err }
+            : { id, file, status: 'queued', progress: 0 },
+        )
       }
       setItems((prev) => [...prev, ...accepted])
       for (const item of accepted) {
         if (item.status === 'queued') void runOne(item)
       }
     },
-    // runOne stable enough for interview; production: refactor deps
     [endpoint, concurrency, maxBytes, accept],
   )
 
-  const abort = (id: string) => {
-    controllers.current.get(id)?.abort()
-  }
+  const abort = (id: string) => controllers.current.get(id)?.abort()
 
   const retry = (id: string) => {
     setItems((prev) => {
@@ -257,8 +234,6 @@ export function useUploadQueue(opts: Options) {
   return { items, enqueue, abort, retry, remove }
 }
 
-// ─── UI ──────────────────────────────────────────────────────────────
-
 export function FileUploader() {
   const { items, enqueue, abort, retry, remove } = useUploadQueue({
     endpoint: '/api/upload',
@@ -270,13 +245,7 @@ export function FileUploader() {
 
   const onChange = (e: ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) enqueue(e.target.files)
-    e.target.value = '' // allow re-select same file
-  }
-
-  const onDrop = (e: DragEvent) => {
-    e.preventDefault()
-    setDragOver(false)
-    if (e.dataTransfer.files) enqueue(e.dataTransfer.files)
+    e.target.value = ''
   }
 
   return (
@@ -287,43 +256,39 @@ export function FileUploader() {
           setDragOver(true)
         }}
         onDragLeave={() => setDragOver(false)}
-        onDrop={onDrop}
+        onDrop={(e: DragEvent) => {
+          e.preventDefault()
+          setDragOver(false)
+          if (e.dataTransfer.files) enqueue(e.dataTransfer.files)
+        }}
         style={{
           border: `2px dashed ${dragOver ? '#36c' : '#aaa'}`,
           padding: 24,
           textAlign: 'center',
         }}
       >
-        <p>Drop files here or</p>
+        <p>Drop files or</p>
         <input type="file" multiple onChange={onChange} />
       </div>
-
       <ul>
         {items.map((it) => (
           <li key={it.id}>
             <strong>{it.file.name}</strong> — {it.status}{' '}
             {it.status === 'uploading' && `${it.progress}%`}
             {it.error && <span style={{ color: 'crimson' }}> {it.error}</span>}
-            {it.url && (
-              <a href={it.url} target="_blank" rel="noreferrer">
-                open
-              </a>
-            )}
-            <span style={{ marginLeft: 8 }}>
-              {it.status === 'uploading' && (
-                <button type="button" onClick={() => abort(it.id)}>
-                  Cancel
-                </button>
-              )}
-              {(it.status === 'error' || it.status === 'aborted') && (
-                <button type="button" onClick={() => retry(it.id)}>
-                  Retry
-                </button>
-              )}
-              <button type="button" onClick={() => remove(it.id)}>
-                Remove
+            {it.status === 'uploading' && (
+              <button type="button" onClick={() => abort(it.id)}>
+                Cancel
               </button>
-            </span>
+            )}
+            {(it.status === 'error' || it.status === 'aborted') && (
+              <button type="button" onClick={() => retry(it.id)}>
+                Retry
+              </button>
+            )}
+            <button type="button" onClick={() => remove(it.id)}>
+              Remove
+            </button>
             {it.status === 'uploading' && (
               <progress value={it.progress} max={100} style={{ display: 'block', width: '100%' }} />
             )}
@@ -335,15 +300,14 @@ export function FileUploader() {
 }
 ```
 
-### Stretch: chunked upload sketch
+### Stretch: chunked upload
 
 ```ts
 async function uploadChunked(file: File, chunkSize = 5 * 1024 * 1024) {
   const total = Math.ceil(file.size / chunkSize)
   const uploadId = await initUpload(file.name, file.size)
   for (let i = 0; i < total; i++) {
-    const blob = file.slice(i * chunkSize, (i + 1) * chunkSize)
-    await putChunk(uploadId, i, blob)
+    await putChunk(uploadId, i, file.slice(i * chunkSize, (i + 1) * chunkSize))
   }
   return completeUpload(uploadId)
 }
@@ -354,48 +318,44 @@ async function uploadChunked(file: File, chunkSize = 5 * 1024 * 1024) {
 | Case | Handling |
 | --- | --- |
 | 0-byte file | Reject or allow per product |
-| Same file selected twice | New id each enqueue; reset input value |
-| Abort mid-upload | `AbortError` → status aborted |
-| Server 413 / virus scan fail | Surface message; retry may not help |
-| Tab close mid-upload | `beforeunload` warn (optional) |
+| Same file twice | New id; reset input value |
+| Abort mid-upload | `AbortError` → aborted |
+| Progress unknown | Indeterminate bar |
 | Concurrency stampede | Semaphore |
-| Progress unknown (`lengthComputable` false) | Indeterminate progress bar |
-| Drag leave flicker | Count enter/leave or use `pointer-events` |
+| Tab close | Optional `beforeunload` |
 
 ## Follow-up interview questions
 
-1. Why XHR for progress instead of `fetch`?
-2. Presigned S3 upload flow vs server proxy?
-3. How do resumable uploads work (tus / multipart S3)?
-4. How to limit client memory for multi-GB files?
-5. CSRF / auth headers on upload?
-6. How to show image preview safely (`URL.createObjectURL` + revoke)?
-7. Virus scanning — where?
-8. What is multipart boundary / `FormData` doing?
+1. Why XHR for progress vs `fetch`?
+2. Presigned S3 vs server proxy?
+3. Resumable uploads (tus / multipart S3)?
+4. Limit memory for multi-GB files?
+5. CSRF / auth on upload?
+6. Safe image preview (`createObjectURL` + revoke)?
+7. Where virus scan?
+8. What does `FormData` multipart do?
 
 ## Common mistakes
 
 | Mistake | Fix |
 | --- | --- |
-| Only `fetch` without progress plan | Use XHR or fetch streaming hacks |
-| No concurrency cap | Browser connection limits / server melt |
-| Trusting client MIME only | Server validates again |
-| Forgetting to revoke object URLs | Memory leaks |
-| Blocking main thread with `FileReader` sync | Async APIs |
-| Can’t cancel | Wire `AbortController` / `xhr.abort` |
+| `fetch` without progress plan | XHR or streaming |
+| No concurrency cap | Connection / server overload |
+| Trust client MIME only | Server validates |
+| Forget revoke object URLs | Leaks |
+| Can’t cancel | Wire abort |
 
 ## Trade-offs
 
 | Choice | Pros | Cons |
 | --- | --- | --- |
-| Through app server | Simple auth | Bandwidth + cost on server |
-| Direct to blob store | Scales | CORS, presign complexity |
-| Chunked resumable | Flaky networks | Protocol complexity |
-| Client compression | Faster | CPU / quality loss |
+| Through app server | Simple auth | Bandwidth cost |
+| Direct to blob store | Scales | CORS / presign |
+| Chunked resumable | Flaky nets OK | Protocol complexity |
+| Client compression | Faster | CPU / quality |
 
-**Interview close:** “Queue files, validate, upload with XHR progress under a concurrency semaphore, support abort/retry, keep per-file state machine explicit.”
+**Interview close:** “Queue → validate → XHR progress under a semaphore → abort/retry with an explicit per-file state machine.”
 
 ## Related
 
-- BE files/CDN: [File CDN](/backend-system-design/06-file-cdn)
-- Async patterns: [JS Async](/javascript/11-async)
+- [File CDN](/backend-system-design/06-file-cdn) · [JS Async](/javascript/11-async)

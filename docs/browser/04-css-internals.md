@@ -1,238 +1,754 @@
 # CSS Internals
 
-CSS is a constraint language + cascade algorithm, not “just styling.” Senior interviews probe **specificity**, **cascade layers**, **inheritance**, **containing blocks**, **stacking contexts**, and **layout modes** (flow, flex, grid) because they explain bugs that DevTools alone won’t.
+This chapter teaches how CSS actually decides what you see, from scratch. You do not need to already know specificity tuples, containing blocks, or stacking contexts. By the end you should be able to explain **the cascade**, **specificity**, **inheritance**, **containing blocks**, **stacking contexts**, and **why some style changes reflow while others only repaint** — with reasons, not memorized slogans.
 
-Related: [Rendering Pipeline](/browser/02-rendering-pipeline) · [Optimization](/browser/09-optimization) · [JS Rendering](/javascript/20-rendering)
+Related: [Rendering Pipeline](/browser/02-rendering-pipeline) · [JS Rendering](/javascript/20-rendering) · [Architecture](/browser/01-architecture)
 
-## Cascade & specificity
+---
+
+## 1. What CSS is trying to do
+
+HTML gives structure. CSS answers:
+
+> For each element, what are its **visual and layout properties** — and when two rules disagree, **who wins**?
+
+CSS is not a paint program. It is a **constraint and conflict-resolution system**:
+
+1. Collect all rules that might apply
+2. Resolve conflicts (**cascade**)
+3. Fill in missing values (**inheritance** / initials)
+4. Compute used values for layout and paint
 
 ```mermaid
 flowchart TB
-  Origin[Origin & importance<br/>UA → user → author]
-  Layers[Cascade layers @layer]
-  Spec[Specificity]
-  Order[Source order]
-  Origin --> Layers --> Spec --> Order
+  Rules["Author / user / UA rules"] --> Match["Match selectors to elements"]
+  Match --> Cascade["Cascade: importance · layers · specificity · order"]
+  Cascade --> Inherit["Inheritance + defaults"]
+  Inherit --> Computed["Computed values"]
+  Computed --> Used["Used values after layout"]
 ```
 
-**Specificity tuple:** `(inline, IDs, classes/attributes/pseudo-classes, elements/pseudo-elements)`. `!important` flips competition into a separate importance lane (author important beats author normal, etc.).
+---
+
+## 2. Declarations, rules, and stylesheets
+
+### 2.1 Plain vocabulary
 
 ```css
-/* 0,1,0,0 */
-#app { }
-/* 0,0,2,1 */
-nav.main a:hover { }
-/* 1,0,0,0 — style="" */
+/* rule = selector + declaration block */
+.button {
+  /* declaration: property + value */
+  color: white;
+  background-color: #0b6;
+}
 ```
 
-### `@layer` (modern cascade control)
+- **Selector** — which elements
+- **Declaration** — one property/value pair
+- **Stylesheet** — a list of rules (plus `@import`, `@media`, `@layer`, …)
+
+Sources of rules:
+
+| Origin | Examples |
+| --- | --- |
+| **User agent (UA)** | Browser default styles (`<a>` blue, underline) |
+| **User** | Reader stylesheets / accessibility preferences |
+| **Author** | Your CSS files, `<style>`, inline `style=""` |
+
+Later cascade steps decide how these compete.
+
+### 2.2 Inline styles
+
+```html
+<div style="color: red">Hi</div>
+```
+
+Inline declarations act like a very specific author rule for that element (see specificity). They are still subject to `!important` battles and cascade layers in modern CSS.
+
+---
+
+## 3. The cascade — conflict resolution from first principles
+
+When two declarations target the same element and property, the cascade picks a winner.
+
+### 3.1 Plain-language order (modern mental model)
+
+From higher priority ideas down:
+
+1. **Importance** — normal vs `!important` (separate championships)
+2. **Origin** — UA vs user vs author (importance flips some pairwise outcomes)
+3. **Cascade layers** (`@layer`) — layer order can beat specificity
+4. **Specificity** — how precise the selector is
+5. **Source order** — last one wins if still tied
+
+```mermaid
+flowchart TB
+  I["1. Importance (normal vs important)"] --> O["2. Origin"]
+  O --> L["3. Cascade layers"]
+  L --> S["4. Specificity"]
+  S --> Ord["5. Source order"]
+```
+
+You do not need every historical edge case. You need to *simulate* everyday conflicts correctly.
+
+### 3.2 Why `!important` exists (and why it hurts)
+
+```css
+.button {
+  color: white;
+}
+
+.button {
+  color: black !important; /* wins over normal declarations */
+}
+```
+
+`!important` is an escape hatch for forcing a win. Overuse makes later overrides painful — you need another `!important` or a carefully designed layer strategy.
+
+Teaching rule:
+
+> Prefer fixing **selector structure** and **layers** over sprinkling `!important`.
+
+---
+
+## 4. Specificity — measuring “how precise”
+
+### 4.1 Intuition before numbers
+
+Which selector feels more specific?
+
+```css
+button {
+  color: black;
+}
+.toolbar button {
+  color: navy;
+}
+#save {
+  color: white;
+}
+```
+
+For `<button id="save" class="toolbar…">`, `#save` is the most precise identity match. Specificity is the formal scoring of that intuition.
+
+### 4.2 The tuple (simplified)
+
+Count:
+
+| Column | What you count |
+| --- | --- |
+| Inline style | `style=""` present? |
+| IDs | `#id` |
+| Classes / attributes / pseudo-classes | `.class`, `[type]`, `:hover` |
+| Elements / pseudo-elements | `div`, `::before` |
+
+Compare left to right; higher column wins.
+
+```css
+/* inline style ≈ strongest author normal specificity */
+/* #app          → 1 ID */
+/* .nav .link    → 2 classes */
+/* nav ul li a   → 4 elements */
+```
+
+```html
+<div id="app" class="wrap" style="color: green">Text</div>
+```
+
+```css
+#app {
+  color: blue; /* loses to inline green (normal importance) */
+}
+.wrap {
+  color: red; /* loses to #app if inline removed */
+}
+```
+
+### 4.3 What does *not* add specificity the way people think
+
+- Universal selector `*` — zero
+- Combinators (`>`, `+`, `~`, space) — zero
+- `:where(...)` — **zero** specificity (useful reset trick)
+- `:is(...)` / `:has(...)` — contribute based on their **most specific argument** (simplified teaching; verify exotic cases in specs when needed)
+
+```css
+:where(.btn) {
+  padding: 8px; /* easy to override */
+}
+
+:is(.btn, #exception) {
+  /* specificity influenced by #exception */
+}
+```
+
+### 4.4 Slow-motion conflict
+
+```html
+<a class="nav-link" id="home" href="/">Home</a>
+```
+
+```css
+a {
+  color: black;
+} /* elements: 1 */
+.nav-link {
+  color: purple;
+} /* classes: 1 */
+#home {
+  color: orange;
+} /* IDs: 1 */
+a.nav-link {
+  color: blue;
+} /* 1 class + 1 element */
+```
+
+Winner for `color`: `#home` → orange.
+
+---
+
+## 5. Cascade layers — specificity’s boss (within the same origin/importance)
 
 ```css
 @layer reset, base, components, utilities;
 
 @layer reset {
-  * { box-sizing: border-box; }
+  button {
+    all: unset; /* careful in real apps */
+  }
 }
+
 @layer components {
-  .btn { padding: 0.5rem 1rem; }
+  button {
+    padding: 0.5rem 1rem;
+    background: #222;
+    color: white;
+  }
 }
+
 @layer utilities {
-  .p-0 { padding: 0; } /* wins over components if same specificity */
+  .p-0 {
+    padding: 0; /* beats components' padding even if lower specificity */
+  }
 }
 ```
 
-Later layers beat earlier layers **regardless of specificity** (within same origin/importance). This is how Tailwind-like utility systems stay predictable.
+Plain language:
 
-## Inheritance vs cascading
+> Layers let you say “utilities always win over components,” without writing absurd selectors.
 
-| Inherited (examples) | Not inherited |
+Without layers, people invent ever-longer selectors or `!important`. Layers restore sanity in design systems (including utility-first approaches).
+
+Unlayered styles sit in an implicit **higher** layer than named layers (author styles) — another common surprise. Put intentional order in an `@layer` list early.
+
+---
+
+## 6. Inheritance — values that flow downward
+
+### 6.1 Plain definition
+
+Some properties, if not specified on a child, take the parent’s **computed** value. That is **inheritance**.
+
+```html
+<article>
+  <p>Hello <strong>there</strong></p>
+</article>
+```
+
+```css
+article {
+  color: #222;
+  font-family: Georgia, serif;
+}
+```
+
+`p` and `strong` inherit `color` and `font-family` unless they set their own.
+
+### 6.2 Inherited vs non-inherited (examples)
+
+| Often inherited | Usually not inherited |
 | --- | --- |
-| `color`, `font-*`, `line-height`, `visibility` | `margin`, `padding`, `border`, `width`, `display` |
+| `color` | `margin`, `padding` |
+| `font-family`, `font-size`, `line-height` | `border`, `width`, `height` |
+| `visibility` | `display`, `background` |
+| `letter-spacing` | `position`, `top`/`left` |
 
-`inherit`, `initial`, `unset`, `revert`, `revert-layer` control computed values explicitly.
+Why? Typography should flow through text. Box geometry usually should not — otherwise every nested div would inherit huge margins accidentally.
+
+### 6.3 Keywords that control computed values
+
+| Keyword | Meaning |
+| --- | --- |
+| `inherit` | Take parent’s computed value |
+| `initial` | Property’s initial value (spec default) |
+| `unset` | `inherit` if inheritable, else `initial` |
+| `revert` | Roll back toward earlier origin (UA/user) |
+| `revert-layer` | Roll back to previous cascade layer |
+
+```css
+.muted {
+  color: inherit;
+  opacity: 0.7;
+}
+
+.button {
+  /* reset author styles toward UA — situational */
+  all: revert;
+}
+```
+
+---
+
+## 7. Computed vs used values
+
+### 7.1 Definitions
+
+- **Specified** — what the cascade chose (may be `%`, `em`, `inherit`)
+- **Computed** — resolved enough to inherit (relative units often absolutized)
+- **Used** — final value after layout (percentages that needed containing-block size)
 
 ```ts
-// Reading used vs computed — interview nuance
-const el = document.querySelector('.box')!
-const computed = getComputedStyle(el).width // e.g. "240px" after layout
-// getComputedStyle returns resolved values; percentages often already computed to px for width
+const el = document.querySelector(".box")!
+const cs = getComputedStyle(el)
+console.log(cs.width) // often a pixel string after layout, e.g. "240px"
 ```
 
-## Box model & containing block
+`getComputedStyle` returns **resolved** values suitable for reading; it is not always identical to the token you wrote in the stylesheet.
+
+---
+
+## 8. The box model — why width fights you
 
 ```mermaid
 flowchart LR
-  CB[Containing block] --> Content[Content]
+  CB["Containing block width"] --> Content["Content"]
   Content --> Padding
   Padding --> Border
   Border --> Margin
 ```
 
-- Default `box-sizing: content-box` vs `border-box` (almost always prefer border-box in apps).
-- **Percentage heights** resolve against the containing block’s height; if parent height is `auto`, percentage often behaves like `auto`.
-- `position: absolute` → containing block is nearest positioned ancestor (or initial).
-- `position: fixed` → normally viewport; under `transform`/`filter`/`perspective` on ancestor, that ancestor becomes the containing block (common “fixed is broken” bug).
-
-## Formatting contexts
-
-| Context | Establishes | Key rules |
-| --- | --- | --- |
-| Block Formatting Context (BFC) | `flow-root`, `overflow` ≠ visible, flex/grid items, etc. | Contains floats; margins don’t collapse through |
-| Inline Formatting Context | Inline content | Line boxes, vertical-align |
-| Flex | `display: flex` | Flex lines, grow/shrink, alignment |
-| Grid | `display: grid` | Tracks, areas, alignment |
-
-**Margin collapse:** adjoining vertical margins of block boxes in flow collapse to max — BFCs prevent collapse across boundaries.
+### 8.1 `content-box` vs `border-box`
 
 ```css
-.card {
-  display: flow-root; /* new BFC without overflow side effects */
+.legacy {
+  box-sizing: content-box; /* width = content only; padding adds outside */
+  width: 200px;
+  padding: 20px; /* total outer content+padding+border grows */
+}
+
+.modern {
+  box-sizing: border-box; /* width includes padding + border */
+  width: 200px;
+  padding: 20px;
 }
 ```
 
-## Stacking contexts & painting order
-
-A stacking context is an atomic layer in z-order.
-
-**Creates stacking context (subset):** `opacity < 1`, `transform` other than `none`, `filter`, `position` + `z-index` other than `auto`, `isolation: isolate`, `will-change`, fixed/sticky in many engines.
+Almost all app CSS resets use:
 
 ```css
-/* Child z-index cannot escape parent stacking context */
-.parent { opacity: 0.99; position: relative; z-index: 1; }
-.child  { position: absolute; z-index: 9999; } /* still under sibling contexts of .parent */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
 ```
 
-Painting order (simplified): background/border of context → negative z-index children → in-flow → floats → in-flow inline → positioned z-index auto → positive z-index.
+Why: humans think “a 200px card including its padding.”
 
-## Flex & Grid interview kernels
+---
 
-**Flex:** `flex-grow` / `flex-shrink` / `flex-basis`; `min-width: auto` prevents shrinking below content unless overridden (`min-width: 0` on nested flex overflow bugs).
+## 9. Containing block — the reference for sizes and positioning
 
-**Grid:** explicit vs implicit tracks; `minmax(0, 1fr)` vs `1fr` (fr uses min-size auto by default — overflow traps).
+### 9.1 Plain definition
+
+A box’s **containing block** is the rectangle used as reference for:
+
+- Percentage sizes (`width: 50%`)
+- `position: absolute` offsets
+- Often `position: fixed` (with important exceptions)
+
+If you do not know the containing block, percentages and absolute positioning feel random.
+
+### 9.2 Common cases
+
+**Normal flow percentage width:** containing block is typically the content box of the block container parent.
+
+```css
+.parent {
+  width: 400px;
+}
+.child {
+  width: 50%; /* → 200px used width */
+}
+```
+
+**Percentage height trap:** if the parent’s height is `auto` (depends on content), a child’s `height: 100%` often cannot resolve to a definite height and behaves like `auto`.
+
+```css
+/* Often NOT a full-viewport panel by itself */
+.section {
+  height: 100%; /* parent must have definite height */
+}
+
+html,
+body {
+  height: 100%;
+}
+.section {
+  height: 100%;
+} /* now chain is definite */
+```
+
+Or use modern viewport units: `min-height: 100dvh`.
+
+### 9.3 Absolute positioning
+
+```css
+.parent {
+  position: relative; /* positioning context */
+}
+.badge {
+  position: absolute;
+  top: 0;
+  right: 0; /* containing block = padding edge of .parent */
+}
+```
+
+Nearest ancestor with `position` not `static` (plus some other cases like certain transforms) establishes the containing block for `absolute`.
+
+### 9.4 Fixed positioning — classic bug
+
+```css
+.modal {
+  position: fixed;
+  inset: 0;
+}
+
+.transformed-parent {
+  transform: translateZ(0); /* creates containing block for fixed descendants */
+}
+```
+
+If an ancestor has `transform`, `filter`, `perspective`, or certain other properties, `position: fixed` may be fixed to **that ancestor**, not the viewport. That is why “my fixed header is scrolling weird” often traces to a transform on a parent.
+
+```mermaid
+flowchart TB
+  V["Viewport"] --> A["Ancestor with transform"]
+  A --> F["position:fixed child<br/>now fixed to A, not V"]
+```
+
+---
+
+## 10. Formatting contexts — how children are laid out
+
+### 10.1 Block Formatting Context (BFC)
+
+A **BFC** is a region where block boxes are laid out. Establishing a new BFC (e.g. `display: flow-root`, `overflow: auto` in many cases) causes:
+
+- Floats to be contained
+- Margin collapsing not to “escape” through the boundary the same way
+
+```css
+.card {
+  display: flow-root; /* modern clearfix-ish containment */
+}
+```
+
+### 10.2 Flex and Grid
 
 ```css
 .row {
   display: flex;
-}
-.row > * {
-  min-width: 0; /* allow shrink / text truncate */
+  gap: 1rem;
 }
 .grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: 1fr 2fr;
 }
 ```
 
-## Selector performance (Blink-shaped)
+These create their own layout algorithms. Children become flex/grid items with different percentage and sizing rules than plain block flow.
 
-Engines match right-to-left. Prefer short, shallow selectors; avoid expensive ones on huge DOMs. Class selectors are fine; premature micro-optimization of selectors is usually dominated by **style invalidation scope** and **layout**.
+You do not need every flex formula here — know that **changing `display` changes the layout mode**, which changes what properties do.
+
+---
+
+## 11. Stacking contexts — who paints on top
+
+### 11.1 Plain definition
+
+A **stacking context** is a local “deck of cards” for painting order. Elements inside are ordered relative to each other; the whole context is ordered as a unit against the outside world.
+
+### 11.2 What creates a stacking context? (common list)
+
+Examples:
+
+- Root element
+- `position`ed element with `z-index` other than `auto`
+- `opacity` < 1
+- `transform` other than `none`
+- `filter` other than `none`
+- `isolation: isolate`
+- Certain `will-change` values
+
+```css
+.dropdown {
+  position: absolute;
+  z-index: 10;
+}
+
+.modal-backdrop {
+  opacity: 0.99; /* new stacking context — can trap z-index battles */
+}
+```
+
+### 11.3 Why z-index “fails”
+
+```html
+<div class="a">
+  <div class="a-child">I want to be on top</div>
+</div>
+<div class="b">Sibling context</div>
+```
+
+```css
+.a {
+  position: relative;
+  z-index: 1;
+  opacity: 0.99;
+}
+.a-child {
+  position: relative;
+  z-index: 9999; /* only competes inside .a's context */
+}
+.b {
+  position: relative;
+  z-index: 2; /* entire .b paints above entire .a */
+}
+```
+
+**Expected:** huge `z-index` on `.a-child` still loses to `.b` because `.a`’s whole context is below `.b`.
+
+```mermaid
+flowchart TB
+  Root["Root stacking context"]
+  A["Context A z-index:1"]
+  B["Context B z-index:2"]
+  Root --> A
+  Root --> B
+  A --> AC["Child z-index:9999<br/>still inside A"]
+```
+
+---
+
+## 12. Reflow vs repaint — CSS property → pipeline stage
+
+This connects directly to [Rendering Pipeline](/browser/02-rendering-pipeline).
+
+### 12.1 Definitions
+
+- **Reflow (layout):** recalculate geometry
+- **Repaint:** redraw pixels / display items without necessarily redoing layout
+- **Composite:** recombine layers (transforms/opacity often land here)
+
+### 12.2 Why certain properties trigger reflow
+
+Anything that changes **size, position in flow, or font metrics** forces layout:
+
+```css
+.trigger-layout {
+  width: 50%;
+  height: 200px;
+  margin: 1rem;
+  padding: 1rem;
+  border-width: 2px;
+  font-size: 18px;
+  display: flex; /* layout mode change */
+}
+```
+
+### 12.3 Why color usually only repaints
+
+```css
+.trigger-paint {
+  color: #fff;
+  background-color: #111;
+  box-shadow: 0 2px 8px rgb(0 0 0 / 20%);
+}
+```
+
+Geometry unchanged → skip layout; still need new paint records.
+
+### 12.4 Why transform/opacity can be “cheap”
+
+```css
+.trigger-composite {
+  transform: translateY(4px);
+  opacity: 0.85;
+}
+```
+
+If the element is on its own layer, the compositor can move/fade without relayout. Not free (layer memory), but good for animation.
+
+### 12.5 Hover styles that explode cost
+
+```css
+/* Expensive if .item is many thousands of nodes */
+.item:hover {
+  font-weight: 700; /* may reflow text */
+}
+```
+
+Prefer hover effects that paint/composite:
+
+```css
+.item:hover {
+  background-color: #f6f6f6;
+  transform: translateY(-1px);
+}
+```
+
+---
+
+## 13. Selector performance — practical truth
+
+Engines match selectors efficiently; micro-optimizing selector strings rarely beats reducing DOM size. Still:
+
+- Very deep selectors and frequent invalidation on huge trees cost style recalc
+- Prefer short class selectors in components
+- Know right-to-left matching intuition: `.nav li a` touches many `a` candidates
+
+```css
+/* clearer + usually enough */
+.nav-link {
+}
+```
+
+Invalidation & containment: see rendering chapter’s `contain` notes.
+
+---
+
+## 14. Custom properties (CSS variables)
+
+```css
+:root {
+  --gap: 1rem;
+  --brand: #0b6;
+}
+
+.card {
+  padding: var(--gap);
+  border-color: var(--brand);
+}
+
+.card.alt {
+  --gap: 2rem; /* scoped override; inherits to descendants */
+}
+```
+
+Custom properties **inherit** by default. Changing a variable on a parent can invalidate styles for descendants that use it — powerful theming, non-zero cost.
+
+```ts
+document.documentElement.style.setProperty("--brand", "#406")
+```
+
+---
+
+## 15. Worked debugging stories
+
+### Story A — “margin collapsed away”
+
+```css
+.outer {
+  margin-top: 40px;
+}
+.inner {
+  margin-top: 40px;
+} /* may collapse with parent in block flow */
+```
+
+Margins of parent/child can **collapse** into one. Establish a BFC / add padding / use flex/grid to avoid surprise.
+
+### Story B — “absolute not relative to what I thought”
+
+Missing `position: relative` on the intended parent → absolute child jumps up to a higher ancestor.
+
+### Story C — “fixed header slides”
+
+Parent with `transform` on a carousel wrapper captures fixed descendants.
+
+### Story D — “z-index ignored”
+
+Parent opacity/transform created a stacking context; child’s z-index cannot escape.
+
+---
+
+## 16. Minimal TypeScript helpers for learning
+
+```ts
+function dumpBox(el: Element): void {
+  const r = el.getBoundingClientRect()
+  const cs = getComputedStyle(el)
+  console.table({
+    width: cs.width,
+    height: cs.height,
+    display: cs.display,
+    position: cs.position,
+    zIndex: cs.zIndex,
+    rectW: r.width,
+    rectH: r.height,
+  })
+}
+```
+
+Use this while changing one property at a time to build intuition for used geometry.
+
+---
 
 ## Interview Questions
 
-**Q1. Specificity of `#a .b` vs `.b.c.d`?**  
-`#a .b` → (0,1,0,1) wait: one ID + one class → (0,1,1,0). `.b.c.d` → (0,0,3,0). ID wins.
+### Q1. What is the cascade?
+**Expected:** The algorithm that resolves conflicting declarations using importance, origin, layers, specificity, and source order.  
+**Common wrong:** “Whichever rule appears last always wins.”  
+**Follow-ups:** Where do `@layer` and `!important` fit?
 
-**Q2. Why doesn’t `z-index: 9999` work?**  
-Ancestor created a stacking context; you’re competing inside it. Check `opacity`, `transform`, `filter`, `z-index` on parents.
+### Q2. Explain specificity with an example.
+**Expected:** Count inline/ID/class/element columns; higher column wins; e.g. `#id` beats `.class`.  
+**Common wrong:** “More selectors in the file = higher specificity.”  
+**Follow-ups:** What does `:where()` do to specificity?
 
-**Q3. `position: fixed` scrolls with a modal — why?**  
-An ancestor has `transform`/`filter`/`perspective`, becoming the fixed containing block.
+### Q3. Inheritance vs cascading?
+**Expected:** Cascade picks the winning declaration for a property on an element; inheritance fills omitted inheritable properties from the parent.  
+**Common wrong:** Using the words interchangeably.  
+**Follow-ups:** Name three inherited and three non-inherited properties.
 
-**Q4. Difference between `visibility: hidden` and `display: none`?**  
-`visibility` keeps layout space and can create descendants that are `visible`. `display: none` removes from render tree.
+### Q4. What is a containing block?
+**Expected:** The reference rectangle for percentage sizing and absolute/fixed positioning.  
+**Common wrong:** “Always the parent element’s border box with no exceptions.”  
+**Follow-ups:** Why does `height: 100%` fail so often? How can `transform` affect `fixed`?
 
-**Q5. How do cascade layers interact with specificity?**  
-Within the same origin and importance, higher-priority layer wins even if specificity is lower. Specificity compares inside a layer.
+### Q5. What is a stacking context? Why did z-index fail?
+**Expected:** A local stacking scope; children cannot interleave with outside elements above their parent context. Opacity/transform/z-index can create contexts.  
+**Common wrong:** “Higher z-index always wins globally.”  
+**Follow-ups:** Give two properties that create a stacking context.
+
+### Q6. Which CSS changes cause reflow vs repaint?
+**Expected:** Geometry/font/flow → reflow; color/background → repaint; transform/opacity often composite.  
+**Common wrong:** “Any CSS change reflows the whole page.”  
+**Follow-ups:** Connect to [Rendering Pipeline](/browser/02-rendering-pipeline).
 
 ## Common Mistakes
 
-- Fighting specificity with `!important` instead of layers/structure.
-- Percentage height chains without definite parent height.
-- Nested flex overflow without `min-width: 0`.
-- Expecting margins to add when they collapse.
-- Using `px`-only layouts that ignore writing modes / zoom / a11y font scaling.
-- Animating layout properties then blaming “CSS is slow.”
+- Fighting specificity with `!important` instead of structure/layers.
+- Assuming percentage heights work without a definite containing-block height.
+- Forgetting `box-sizing` when doing width math.
+- Expecting `z-index` to escape a parent stacking context.
+- Animating layout properties for hover micro-interactions.
+- Using `position: fixed` inside transformed ancestors without checking.
 
-## Trade-offs
+## Trade-offs / Production Notes
 
-| Approach | Pros | Cons |
-| --- | --- | --- |
-| Utility CSS | Predictable cascade with layers | Verbosity; design consistency needs tokens |
-| BEM / low specificity | Rare fights | Naming overhead |
-| CSS-in-JS runtime | Colocation | Style recalc, FOUC, cache pressure |
-| Container queries | Component-responsive | Older browser gaps; extra queries |
-| Heavy grid/flex nesting | Expressive layouts | Harder mental model + cost |
-
-**Senior takeaway:** Debug CSS in this order — **containing block → formatting context → cascade/layer → stacking context → layout mode algorithm**.
-
-## Deep dive — used vs computed vs specified
-
-| Level | Meaning |
-| --- | --- |
-| Specified | After cascade, before computation |
-| Computed | Absolute-ish, inheritance resolved (e.g. `em` → px relative) |
-| Used | After layout (percentages resolved against CB) |
-| Actual | Possibly approximated for paint (rounding) |
-
-`getComputedStyle` ≈ computed/used hybrid depending on property — interviews accept “resolved value you’d see applied.”
-
-## Deep dive — container queries
-
-```css
-.card-root {
-  container-type: inline-size;
-  container-name: card;
-}
-@container card (min-width: 400px) {
-  .meta { display: flex; }
-}
-```
-
-Query the **container**, not the viewport — component-level responsiveness. Establishes containment; pair with [Optimization](/browser/09-optimization).
-
-## Deep dive — subgrid & nesting
-
-`grid-template` subgrid lets children align to parent tracks — powerful for design systems, still check support matrices. Nested flex/grid increases layout cost on large trees.
-
-## Extra Q&A
-
-**Q6. `em` vs `rem`?**  
-`em` relative to element font-size (compounds); `rem` relative to root — prefer rem for spacing scales.
-
-**Q7. Does `opacity: 0.99` create a stacking context?**  
-Yes if opacity ≠ 1 — common accidental trap.
-
-**Q8. `currentColor`?**  
-Uses computed `color` — inherits conceptually for borders/SVGs.
-
-**Q9. Why `100vh` mobile bugs?**  
-Viewport units vs dynamic browser chrome — prefer `dvh`/`svh`/`lvh` where supported.
-
-**Q10. Cascade for shadow DOM?**  
-Shadow tree has separate scope; CSS variables pierce; `::part` / `:host` for intentional styling. Related to Web Components interviews.
-
-
-## Worked example — “dropdown clipped”
-
-Cause: ancestor `overflow: hidden` + stacking. Fix: portal to `document.body` (React portals) or rethink overflow. Containing block for `position: absolute` wasn’t the viewport.
-
-## Cascade layers migration strategy
-
-1. Wrap existing CSS in `@layer legacy`.  
-2. New components in `@layer components`.  
-3. Utilities last.  
-Eliminates specificity wars without rewriting selectors overnight.
-
-## Logical properties
-
-`margin-inline-start` vs `margin-left` — writing-mode aware. Senior signal for i18n-ready CSS.
-
-## Glossary
-
-| Term | Definition |
-| --- | --- |
-| Specificity | Selector weight tuple |
-| Containing block | Reference box for positioning/sizing |
-| BFC | Block formatting context |
-| Stacking context | Z-order atomic group |
-| Used value | Post-layout value |
+- Design systems: prefer **`@layer`** + predictable class strategies over specificity wars.
+- Resets: `border-box` globally; be careful with `all: unset` on rich components.
+- Measure style invalidation on large lists; virtualize DOM when needed.
+- Document stacking/overflow conventions for modals, popovers, and nav.
+- Related: [Rendering Pipeline](/browser/02-rendering-pipeline) · [JS Rendering](/javascript/20-rendering) · [Browser Event Loop](/browser/03-event-loop)

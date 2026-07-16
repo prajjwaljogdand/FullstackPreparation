@@ -1,455 +1,670 @@
 # Closures
 
-A **closure** is a function bundled with its **lexical environment** — the bindings it can reach by walking the scope chain. Interview bar: explain *what is retained*, *why engines keep it*, and *when it leaks*.
+This chapter teaches closures from scratch. You do not need to already know the word “closure,” “free variable,” or “lexical environment.” By the end you should be able to explain **what a closure is**, **what data is actually retained**, **why the language needs this behavior**, **how memory and garbage collection interact with closures**, and **how closures show up in React, Express, event listeners, and auth code**.
 
-## Definition that survives follow-ups
+Prerequisites worth skimming first: [Scope](/javascript/03-scope), [Execution Context](/javascript/02-execution-context). You can still start here — we rebuild the needed ideas.
+
+---
+
+## 1. The problem closures solve
+
+You want a function that **remembers** something from when it was created:
 
 ```ts
-function outer(x: number) {
-  return function inner(y: number) {
-    return x + y // x is free → resolved in outer's environment
+function makeMultiplier(factor: number) {
+  return function multiply(n: number) {
+    return n * factor
   }
 }
 
-const add5 = outer(5)
-add5(10) // 15
+const double = makeMultiplier(2)
+const triple = makeMultiplier(3)
+
+console.log(double(5)) // 10
+console.log(triple(5)) // 15
 ```
 
-After `outer` returns, its **execution context** is gone. The **lexical environment** that holds `x` remains reachable from `inner`, so it is not GC'd.
+After `makeMultiplier(2)` returns, that call’s stack frame is gone. Yet `double` still knows `factor` is `2`.
+
+Without a mechanism to keep `factor` alive, this pattern would be impossible. That mechanism is the **closure**.
+
+Plain-language definition:
+
+> A **closure** is a function bundled with the **outer variables it needs** — the function can use those variables even after the outer function has finished running.
+
+Slightly more precise:
+
+> A closure is a function plus a reference to the **lexical environment** in which it was created, so free variables resolve to the bindings from that environment.
+
+---
+
+## 2. Free variables — the names that force a closure
+
+Inside `multiply`, `n` is a **parameter** (local). `factor` is **not declared** in `multiply` — it comes from outside. `factor` is a **free variable** relative to `multiply`.
+
+```ts
+return function multiply(n: number) {
+  return n * factor // `factor` is free here
+}
+```
+
+Whenever a function uses free variables, the engine must remember where those names live. That remembered link is what people mean by “the function closes over `factor`.”
 
 ```mermaid
 flowchart LR
-  subgraph surviving ["Still reachable"]
-    InnerFn["inner function object"]
-    Env["Environment Record\n{ x: 5 }"]
-    InnerFn -->|"[[Environment]]"| Env
-  end
-  subgraph gone ["Popped"]
-    EC["outer execution context"]
-  end
+  M["multiply function object"]
+  Env["Lexical environment of makeMultiplier call"]
+  M -->|"[[Environment]]"| Env
+  Env --> factor["factor: 2"]
 ```
 
-**Capture is by reference to bindings**, not a snapshot of values:
+You do not write `[[Environment]]` in code — it is an internal slot. DevTools “Scope → Closure” panels show the same idea.
+
+---
+
+## 3. What is actually stored? (not a snapshot of values)
+
+### 3.1 Wrong intuition: “it copied the number 2”
+
+Many people think:
+
+```ts
+const double = makeMultiplier(2)
+// surely `double` stored a private copy of the value 2 forever?
+```
+
+For primitives this **looks** similar to a copy, but the accurate model is:
+
+> The closure keeps a **live reference to the binding** (the variable itself), not a frozen photocopy of whatever value it had at creation time — unless you create a new binding per closure (e.g. loop `let`).
+
+### 3.2 Live bindings — mutation is visible
+
+```ts
+function makeWatcher() {
+  let count = 0
+
+  function inc() {
+    count++
+  }
+
+  function read() {
+    return count
+  }
+
+  return { inc, read }
+}
+
+const w = makeWatcher()
+console.log(w.read()) // 0
+w.inc()
+w.inc()
+console.log(w.read()) // 2 — same `count` binding
+```
+
+Both `inc` and `read` close over the **same** `count` binding.
+
+```mermaid
+flowchart TB
+  subgraph heap ["Heap"]
+    Env["Environment { count: 2 }"]
+    Inc["inc ƒ"]
+    Read["read ƒ"]
+  end
+  Inc --> Env
+  Read --> Env
+```
+
+### 3.3 Objects — the reference is retained
+
+```ts
+function attach(user: { name: string }) {
+  return function label() {
+    return `User: ${user.name}`
+  }
+}
+
+const ada = { name: "Ada" }
+const label = attach(ada)
+ada.name = "Grace"
+console.log(label()) // "User: Grace"
+```
+
+The closure retained the **reference** to the object. Mutating the object is visible. (Same reference rules as [Fundamentals](/javascript/01-fundamentals).)
+
+### 3.4 What is *not* stored automatically
+
+The closure retains bindings that are **reachable through free-variable needs** (engines can optimize, but conceptually: closed-over variables). It does not mean “the entire outer function’s stack frame stays on the call stack.” The outer **execution context** is popped; the **environment record** may remain on the heap.
+
+```ts
+function outer() {
+  const huge = new Array(1_000_000).fill("x")
+  const tiny = 1
+  return function inner() {
+    return tiny // only needs tiny
+  }
+}
+```
+
+In theory only `tiny` must be retained. In practice, engines vary; older engines sometimes retained more than expected. Do not assume `huge` is always freed — measure if it matters ([Memory](/javascript/12-memory)). Mentally: **closing over a value can extend its lifetime**.
+
+---
+
+## 4. Why closures exist (design purpose)
+
+Closures are not an accident. They enable:
+
+### 4.1 Data hiding / encapsulation
+
+```ts
+function createBankAccount(initial: number) {
+  let balance = initial // private
+
+  return {
+    deposit(amount: number) {
+      balance += amount
+    },
+    getBalance() {
+      return balance
+    },
+  }
+}
+
+const acct = createBankAccount(100)
+acct.deposit(50)
+console.log(acct.getBalance()) // 150
+// console.log(acct.balance) // undefined — no public field
+```
+
+Before ES modules / `#private` fields were common, this **module pattern** / revealing module pattern used closures for privacy.
+
+### 4.2 Function factories / configuration
+
+```ts
+function makeLogger(prefix: string) {
+  return (msg: string) => console.log(`${prefix}: ${msg}`)
+}
+
+const authLog = makeLogger("auth")
+authLog("login ok")
+```
+
+### 4.3 Callbacks that need context
+
+```ts
+function loadUser(id: string, onDone: (name: string) => void) {
+  fetch(`/api/users/${id}`)
+    .then((r) => r.json())
+    .then((user) => onDone(user.name))
+}
+
+function main() {
+  const label = "User"
+  loadUser("1", (name) => {
+    console.log(label, name) // closes over `label`
+  })
+}
+```
+
+### 4.4 Partial application
+
+```ts
+function add(a: number, b: number) {
+  return a + b
+}
+
+function partialAdd(a: number) {
+  return (b: number) => add(a, b)
+}
+
+const add10 = partialAdd(10)
+console.log(add10(5)) // 15
+```
+
+Closures are how JS does a lot of what other languages use objects or explicit “environment” structs for.
+
+---
+
+## 5. Creation time vs call time
+
+### 5.1 Capture happens when the inner function is **created**
+
+The lexical environment link is fixed when the function object is created (when the `function` / `=>` expression runs), not when you later call it.
+
+```ts
+function build() {
+  let x = 1
+  const f = () => x
+  x = 2
+  return f
+}
+
+const f = build()
+console.log(f()) // 2 — live binding, current value
+```
+
+### 5.2 Call time only reads the binding
 
 ```ts
 function make() {
   let n = 0
-  return {
-    inc: () => ++n,
-    get: () => n,
-  }
+  return () => ++n
 }
-const c = make()
-c.inc()
-c.get() // 1 — shared mutable binding
+
+const a = make()
+const b = make()
+console.log(a()) // 1
+console.log(a()) // 2
+console.log(b()) // 1 — separate environment per make() call
 ```
 
----
-
-## What is actually stored?
-
-Engines differ (V8 Context / ContextExtension, SpiderMonkey environments), but the interview-accurate model:
-
-| Artifact | Contains | Lifetime |
-| --- | --- | --- |
-| Function object | bytecode / feedback + pointer to lexical environment | while references exist |
-| Lexical environment | environment record + `outer` link | while any closure (or child env) references it |
-| Environment record | slots for `let`/`const`/`var`/params | same |
-| Execution context | temporary activation (`this`, stack state) | call duration only |
-
-### Not a private copy of the whole scope
-
-Naive myth: "the closure copies all local variables." Reality:
-
-- The function retains a link to an **environment**.
-- Engines often **optimize** to keep only variables that escape (are used by nested functions).
-- If *any* variable in an environment escapes, sometimes siblings stay alive too (implementation detail — don't rely on partial GC of one binding).
-
-```ts
-function big() {
-  const huge = new Array(1e6).fill(0)
-  const tiny = 1
-  return () => tiny
-  // Hope: huge GC'd. Reality: may or may not — depends on env sharing.
-}
-```
-
-Safer pattern when retaining a long-lived closure:
-
-```ts
-function big() {
-  const huge = new Array(1e6).fill(0)
-  const tiny = 1
-  // use huge...
-  return ((t: number) => () => t)(tiny) // only t escapes
-}
-```
-
-### Shared environments across multiple closures
-
-```ts
-function pair() {
-  let n = 0
-  return {
-    a: () => ++n,
-    b: () => n,
-  }
-}
-const { a, b } = pair()
-a()
-b() // 1 — same environment record
-```
+Each call to `make()` creates a **new** environment. Closures from different calls do not share `n`.
 
 ```mermaid
 flowchart TB
-  A["fn a"] --> E["shared LE { n }"]
-  B["fn b"] --> E
+  Make1["make() call #1 env { n }"]
+  Make2["make() call #2 env { n }"]
+  A["a ƒ"] --> Make1
+  B["b ƒ"] --> Make2
 ```
 
 ---
 
-## Why closures exist (design purpose)
-
-1. **Data hiding / encapsulation** without classes  
-2. **Partial application / currying** — bake in config  
-3. **Callbacks** that remember request/user/context  
-4. **Module pattern** (pre-ESM) and factory functions  
-5. **Hooks & middleware** — stateful behavior as first-class values  
-
-Without closures, you'd pass context objects everywhere (`ctx.n`, `ctx.user`) or use globals. Closures are the language's lightweight capability for **capability-based** APIs: give a function, not the raw binding.
+## 6. Nested closures and the scope chain
 
 ```ts
-function createBank(initial: number) {
-  let balance = initial
-  return {
-    deposit: (n: number) => {
-      balance += n
-    },
-    withdraw: (n: number) => {
-      if (n > balance) throw new Error("insufficient")
-      balance -= n
-    },
-    getBalance: () => balance,
+function level1(a: number) {
+  return function level2(b: number) {
+    return function level3(c: number) {
+      return a + b + c
+    }
   }
 }
-// no public write to balance except through methods
+
+console.log(level1(1)(2)(3)) // 6
 ```
+
+`level3` closes over `a` and `b` through the chain:
+
+```mermaid
+flowchart LR
+  L3["level3 env"] --> L2["level2 env { b }"] --> L1["level1 env { a }"]
+```
+
+Deep chains are powerful and can make code hard to follow. Prefer flatter structures when nesting is only for privacy.
 
 ---
 
-## Creation time vs call time
+## 7. Classic interview puzzles — slow walkthroughs
 
-| | Lexical variables (`x`) | `this` (non-arrow) | `arguments` |
-| --- | --- | --- | --- |
-| Resolved | Definition scope | Call site | Call (non-arrow) |
-| Closed over? | yes | arrows only | rare / avoid |
+### 7.1 The `var` loop
+
+```ts
+const fns: Array<() => number> = []
+
+for (var i = 0; i < 3; i++) {
+  fns.push(function () {
+    return i
+  })
+}
+
+console.log(fns.map((f) => f())) // [3, 3, 3]
+```
+
+**Why:**
+
+1. `var i` is **one** binding for the enclosing function/global.
+2. Each pushed function closes over **that same** `i`.
+3. After the loop, `i === 3`.
+4. Calling the functions later reads `3`.
+
+### 7.2 Fix with `let`
+
+```ts
+const fns: Array<() => number> = []
+
+for (let i = 0; i < 3; i++) {
+  fns.push(function () {
+    return i
+  })
+}
+
+console.log(fns.map((f) => f())) // [0, 1, 2]
+```
+
+`let` in a `for` head creates a **new binding per iteration**. Each function closes over a different `i`.
+
+### 7.3 Fix with an IIFE (legacy)
+
+```ts
+const fns: Array<() => number> = []
+
+for (var i = 0; i < 3; i++) {
+  fns.push(
+    (function (j) {
+      return function () {
+        return j
+      }
+    })(i),
+  )
+}
+```
+
+The IIFE creates a new function scope per iteration with parameter `j` holding the current `i`.
+
+### 7.4 Closures and `this` (preview)
 
 ```ts
 const obj = {
-  x: 1,
-  make() {
-    return () => this.x // arrow closes over this from make
+  n: 1,
+  // bad for `this` if detached — see this chapter
+  getN() {
+    return this.n
   },
-  makeBad() {
-    return function () {
-      return this.x // this from call site
-    }
-  },
+  // closure over obj via lexical this of arrow in methods — careful in objects
 }
-
-const f = obj.make()
-f() // 1
-const g = obj.makeBad()
-g() // undefined / global — lost receiver
 ```
+
+Closures capture **variables**. They do **not** magically fix `this` for traditional functions. Arrows capture lexical `this`. Full story: [`this`](/javascript/06-this).
 
 ---
 
-## Classic interview puzzles
+## 8. Memory & GC — when closures keep things alive
 
-### Loop + `var`
+### 8.1 Reachability
+
+Garbage collection frees objects that are **unreachable**. A closure that references a binding keeps that binding’s value reachable.
 
 ```ts
-function build() {
-  const out: Array<() => number> = []
-  for (var i = 0; i < 3; i++) {
-    out.push(() => i)
+function setup() {
+  const cache = new Map<string, string>()
+  cache.set("a", "big".repeat(10000))
+
+  return function lookup(key: string) {
+    return cache.get(key)
   }
-  return out
 }
-build().map((f) => f()) // [3,3,3]
+
+const lookup = setup()
+// `cache` stays alive as long as `lookup` is reachable
 ```
 
-One binding `i`, mutated to `3`. Fix: `let`, or IIFE / `bind`, or push with parameter capture.
+If you store `lookup` in a long-lived place (global, React state, a listener registry), `cache` lives too.
 
-### Accidental capture in async
+### 8.2 Accidental retention
 
 ```ts
-for (var i = 0; i < 3; i++) {
-  setTimeout(() => console.log(i), 0)
-}
-// 3 3 3
-```
+function attachHandler(el: HTMLElement) {
+  const huge = readHugeFile() // imagine a big string / buffer
 
-Same binding issue; timers fire after the loop. See [Event Loop](/javascript/10-event-loop).
+  function onClick() {
+    console.log("clicked", el.id)
+    // forgot: we closed over `huge` even if we don't use it in the body?
+    // If the body references huge, it is retained. If not, engine may drop it —
+    // but if you reference it even once, it stays.
+  }
 
-### Returning methods that share state
-
-```ts
-function Counter() {
-  let n = 0
-  this.inc = () => ++n
-  this.get = () => n
-}
-```
-
-Prototype methods wouldn't close over per-instance `n` unless stored on `this` — factory + closure vs class fields trade-off.
-
----
-
-## Memory & GC — when closures leak
-
-A closure keeps its environment alive. Leaks = **long-lived references** to functions that close over **large** or **growing** data.
-
-```mermaid
-flowchart TD
-  Root["GC root: global / DOM / store"] --> Listener["event listener fn"]
-  Listener --> Env["closed-over env"]
-  Env --> Huge["large object / detached DOM"]
-```
-
-### Patterns that retain memory
-
-| Pattern | Retention |
-| --- | --- |
-| `element.addEventListener('click', handler)` | handler → env → anything it closes over |
-| React `useEffect(() => {...}, [])` | effect closure until cleanup / unmount |
-| Express middleware factory | per-app lifetime |
-| Module-level caches inside closures | process lifetime |
-| Uncleared `setInterval` | forever until clear |
-
-### Detached DOM example
-
-```ts
-function setup(button: HTMLButtonElement) {
-  const panel = document.getElementById("panel") // large subtree
-  button.addEventListener("click", () => {
-    console.log(panel?.id)
+  // Worse pattern: close over everything in scope unintentionally
+  el.addEventListener("click", () => {
+    console.log(huge.length) // pins huge for the listener's lifetime
   })
-  // even if panel removed from document, listener may keep it alive
 }
 ```
 
-Mitigations: remove listeners, `AbortController`, null out refs, close over IDs not nodes, WeakRef/WeakMap where appropriate.
+**Rule:** Anything a long-lived callback references can outlive the code that “felt temporary.”
 
-### Growing closed-over arrays
+### 8.3 Detaching listeners
 
 ```ts
-function logger() {
-  const lines: string[] = []
-  return (msg: string) => {
-    lines.push(msg) // grows forever if fn lives forever
-    console.log(msg)
+function mount(el: HTMLElement) {
+  const onScroll = () => {
+    console.log(el.scrollTop)
+  }
+  window.addEventListener("scroll", onScroll)
+
+  return function unmount() {
+    window.removeEventListener("scroll", onScroll)
+    // allow GC of onScroll → and anything it closed over
   }
 }
 ```
 
-### Module singleton "closures"
+Failing to remove listeners is a classic leak: the closure stays registered, retaining DOM nodes and data. Related: [Memory](/javascript/12-memory).
+
+### 8.4 Modules as long-lived closures
 
 ```ts
-// auth.ts
-let secret: string | null = null
+// config.ts
+let secret = "initial"
+
 export function setSecret(s: string) {
   secret = s
 }
+
 export function getSecret() {
   return secret
 }
 ```
 
-Module scope *is* a long-lived environment — intentional for DI, dangerous for unbounded caches.
-
-Deep dive: [Memory Management](/javascript/12-memory).
+Module scope is a long-lived environment. Exports that close over module state persist for the life of the module instance ([Modules](/javascript/13-modules)).
 
 ---
 
-## Nested closures & scope chain length
+## 9. IIFE and the module pattern
 
 ```ts
-function a(x: number) {
-  return function b(y: number) {
-    return function c(z: number) {
-      return x + y + z
-    }
+const Counter = (function () {
+  let n = 0
+
+  function inc() {
+    n++
   }
-}
-a(1)(2)(3) // 6
-```
 
-Each level adds an environment link. Engines optimize, but deep nesting is a readability cost. Prefer flattening or explicit context objects for deep pipelines.
-
----
-
-## IIFE and the module pattern
-
-```ts
-const api = (function () {
-  const privateKey = "..."
-  function sign(payload: string) {
-    return privateKey + payload
+  function value() {
+    return n
   }
-  return { sign }
+
+  return { inc, value }
 })()
+
+Counter.inc()
+console.log(Counter.value()) // 1
 ```
 
-ESM replaced most IIFE modules; still appears in bundles, bookmarklets, and isolating `var`.
+Slow walkthrough:
+
+1. The outer function runs **immediately**.
+2. It creates `n` and inner functions.
+3. It returns a public API object.
+4. Outer function ends; `n` remains via closures on `inc` / `value`.
+
+Today ES modules often replace this pattern, but the **closure privacy** idea is the same.
 
 ---
 
-## Partial application & factories
-
-Closures are the implementation mechanism for curry/partial — see [Functions](/javascript/09-functions).
+## 10. Partial application & factories in real APIs
 
 ```ts
-function multiply(a: number) {
-  return (b: number) => a * b
+type FetchFn = (url: string, init?: RequestInit) => Promise<Response>
+
+function createApiClient(baseUrl: string, fetchImpl: FetchFn = fetch) {
+  return {
+    get(path: string) {
+      return fetchImpl(`${baseUrl}${path}`)
+    },
+    post(path: string, body: unknown) {
+      return fetchImpl(`${baseUrl}${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      })
+    },
+  }
 }
-const double = multiply(2)
+
+const api = createApiClient("https://example.com")
+api.get("/users")
 ```
 
-Config baked at creation; call sites stay thin.
+`get` / `post` close over `baseUrl` and `fetchImpl`. This is idiomatic “factory returns object of closures.”
 
 ---
 
-## React examples {#react-stale-closures}
+## 11. React examples {#react-stale-closures}
 
-### Stale closure in effects / handlers
+React function components re-run on render. Event handlers and effects often **close over** props/state from a specific render. That is the source of **stale closure** bugs.
+
+### 11.1 Stale state in a timeout
 
 ```tsx
-function Search({ query }: { query: string }) {
-  useEffect(() => {
-    const id = setInterval(() => {
-      console.log(query) // may be stale if deps wrong
+import { useState } from "react"
+
+export function BrokenCounter() {
+  const [count, setCount] = useState(0)
+
+  function handleClick() {
+    setTimeout(() => {
+      // closes over `count` from the render when handleClick was created
+      console.log(count)
+      setCount(count + 1) // may overwrite newer updates
     }, 1000)
-    return () => clearInterval(id)
-  }, []) // ❌ empty deps — forever sees initial query
-  return null
+  }
+
+  return <button onClick={handleClick}>{count}</button>
 }
 ```
 
-Fix: include `query` in deps, or use a ref for latest value:
+If the user clicks quickly, each timeout may see an **old** `count`.
+
+**Fix — functional updates:**
 
 ```tsx
-function Search({ query }: { query: string }) {
-  const queryRef = useRef(query)
-  queryRef.current = query
+setCount((c) => c + 1) // React gives latest state; less reliance on closed-over count
+```
+
+**Fix — refs for always-current values:**
+
+```tsx
+import { useEffect, useRef, useState } from "react"
+
+export function LatestCountLogger() {
+  const [count, setCount] = useState(0)
+  const countRef = useRef(count)
+
+  useEffect(() => {
+    countRef.current = count
+  }, [count])
 
   useEffect(() => {
     const id = setInterval(() => {
-      console.log(queryRef.current) // always latest
+      console.log(countRef.current) // not a stale render snapshot
     }, 1000)
     return () => clearInterval(id)
   }, [])
-  return null
+
+  return <button onClick={() => setCount((c) => c + 1)}>{count}</button>
 }
 ```
 
-### Functional `setState` avoids stale state
+### 11.2 `useEffect` missing dependencies
 
 ```tsx
-setCount((c) => c + 1) // not setCount(count + 1) inside async
+useEffect(() => {
+  const id = setInterval(() => {
+    console.log(count) // eslint warns: count should be a dependency
+  }, 1000)
+  return () => clearInterval(id)
+}, []) // empty deps: effect closure forever sees initial count
 ```
 
-### `useCallback` closes over deps
+The empty dependency array means: “create this effect closure once.” It captures the first render’s `count`.
 
-```tsx
-const onSave = useCallback(() => {
-  save(userId)
-}, [userId]) // new function when userId changes — intentional
+**Mental model:** every render creates **new** function values. Effects/handlers close over the props/state from the render that created them — unless you use refs or functional updates.
+
+```mermaid
+sequenceDiagram
+  participant R1 as Render count=0
+  participant R2 as Render count=1
+  participant T as Timeout from R1
+  R1->>T: schedule with closure count=0
+  R2->>R2: count is now 1
+  T->>T: still reads 0 from R1 closure
 ```
 
-Missing deps → stale; over-broad deps → churn. Closures are why the dependency array exists.
-
-### Custom hooks as closure factories
+### 11.3 Event handlers in lists
 
 ```tsx
-function useAuthHeader(token: string | null) {
-  return useCallback(
-    (init: RequestInit = {}): RequestInit => ({
-      ...init,
-      headers: {
-        ...init.headers,
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      },
-    }),
-    [token],
+function List({ items }: { items: string[] }) {
+  return (
+    <ul>
+      {items.map((item) => (
+        <li key={item}>
+          <button
+            onClick={() => {
+              console.log(item) // closes over this iteration's item — good
+            }}
+          >
+            {item}
+          </button>
+        </li>
+      ))}
+    </ul>
   )
 }
 ```
 
-### Event handlers and list items
+Here closures are **desired**: each handler remembers its `item`.
 
-```tsx
-items.map((item) => (
-  <button key={item.id} onClick={() => select(item.id)}>
-    {item.name}
-  </button>
-))
+### 11.4 Custom hooks as closure factories
+
+```ts
+import { useCallback, useState } from "react"
+
+function useToggle(initial = false) {
+  const [on, setOn] = useState(initial)
+  const toggle = useCallback(() => setOn((v) => !v), [])
+  return [on, toggle] as const
+}
 ```
 
-Each handler closes over `item` / `id`. Fine at moderate scale; for huge lists, prefer delegation (one listener) to cut function allocation — measure first.
-
-### React Strict Mode double-mount
-
-Effects run twice in dev — closures in setup/cleanup must be idempotent; don't assume single subscription without cleanup.
+`toggle` closes over `setOn` (stable) and uses functional updates — a small, intentional closure.
 
 ---
 
-## Express middleware {#express-middleware}
+## 12. Express middleware {#express-middleware}
 
-Middleware factories are closures over config and shared state.
+### 12.1 Configuration closed over by middleware
 
 ```ts
 import type { Request, Response, NextFunction } from "express"
 
-function rateLimit(opts: { windowMs: number; max: number }) {
-  const hits = new Map<string, { count: number; reset: number }>()
-
-  return function rateLimitMiddleware(
-    req: Request,
-    res: Response,
-    next: NextFunction,
-  ) {
-    const key = req.ip ?? "unknown"
-    const now = Date.now()
-    let entry = hits.get(key)
-    if (!entry || now > entry.reset) {
-      entry = { count: 0, reset: now + opts.windowMs }
-      hits.set(key, entry)
-    }
-    entry.count++
-    if (entry.count > opts.max) {
-      res.status(429).json({ error: "too many requests" })
-      return
-    }
-    next()
-  }
-}
-
-// app.use(rateLimit({ windowMs: 60_000, max: 100 }))
-```
-
-What lives forever:
-
-- `hits` Map — **process lifetime** (memory leak if unbounded keys — use TTL eviction / Redis).
-- `opts` — small, fine.
-
-```ts
 function requireRole(role: string) {
-  return (req: Request, res: Response, next: NextFunction) => {
-    const user = (req as Request & { user?: { roles: string[] } }).user
-    if (!user?.roles.includes(role)) {
-      res.status(403).end()
+  return function middleware(req: Request, res: Response, next: NextFunction) {
+    const user = (req as any).user as { roles?: string[] } | undefined
+    if (!user?.roles?.includes(role)) {
+      res.status(403).json({ error: "forbidden" })
+      return
+    }
+    next()
+  }
+}
+
+// app.get("/admin", requireRole("admin"), handler)
+```
+
+`requireRole("admin")` returns a middleware function that **remembers** `role`.
+
+### 12.2 Shared mutable state — careful
+
+```ts
+function rateLimit(limit: number) {
+  const hits = new Map<string, number>()
+
+  return function middleware(req: Request, res: Response, next: NextFunction) {
+    const ip = req.ip ?? "unknown"
+    const n = (hits.get(ip) ?? 0) + 1
+    hits.set(ip, n)
+    if (n > limit) {
+      res.status(429).end()
       return
     }
     next()
@@ -457,411 +672,378 @@ function requireRole(role: string) {
 }
 ```
 
-Closure over `role` string — cheap, correct.
+All requests share the same `hits` Map via one closure. That is useful (in-memory limiter) and dangerous (unbounded Map growth → memory leak; multi-instance deploys don’t share memory).
 
-### Request-scoped vs app-scoped capture
-
-```ts
-// ❌ capturing mutable req across async if reused wrongly
-function bad() {
-  let lastReq: Request
-  return (req: Request, _res: Response, next: NextFunction) => {
-    lastReq = req
-    setTimeout(() => {
-      console.log(lastReq.url) // may be a later request
-    }, 100)
-    next()
-  }
-}
-```
-
-Always close over the *current* `req` in the same tick's callback, or copy needed fields:
+### 12.3 Per-request closures
 
 ```ts
-return (req, _res, next) => {
-  const url = req.url
-  setTimeout(() => console.log(url), 100)
+app.use((req, res, next) => {
+  const requestId = crypto.randomUUID()
+  res.locals.log = (msg: string) => console.log(requestId, msg)
   next()
-}
+})
 ```
 
-Related: [Node middleware](/node/09-middleware), [JWT & Auth](/node/08-jwt-auth).
+`res.locals.log` closes over `requestId` for that request.
 
 ---
 
-## Event listeners {#event-listeners}
+## 13. Event listeners {#event-listeners}
 
 ```ts
-function onOutsideClick(el: HTMLElement, cb: () => void) {
-  function handler(e: MouseEvent) {
-    if (!el.contains(e.target as Node)) cb()
+function wireSearch(input: HTMLInputElement, onQuery: (q: string) => void) {
+  let last = ""
+
+  function handler() {
+    const q = input.value.trim()
+    if (q === last) return
+    last = q
+    onQuery(q)
   }
-  document.addEventListener("click", handler)
-  return () => document.removeEventListener("click", handler)
+
+  input.addEventListener("input", handler)
+
+  return () => input.removeEventListener("input", handler)
 }
 ```
 
-`handler` closes over `el` and `cb`. The returned disposer must run or the pair leaks.
+`handler` closes over `input`, `onQuery`, and `last`. The returned cleanup function closes over the **same** `handler` reference so removal works.
 
-### AbortController pattern
-
-```ts
-function listen(
-  target: EventTarget,
-  type: string,
-  fn: EventListener,
-  signal: AbortSignal,
-) {
-  target.addEventListener(type, fn, { signal })
-}
-
-const ac = new AbortController()
-listen(window, "resize", () => resize(), ac.signal)
-// unmount:
-ac.abort() // removes all listeners registered with signal
-```
-
-### Closures vs `bind`
+**Bug pattern:**
 
 ```ts
-button.addEventListener("click", this.onClick.bind(this))
-// bind creates a new function — must store ref to remove
+// cannot remove — each arrow is a new function
+input.addEventListener("input", () => onQuery(input.value))
+input.removeEventListener("input", () => onQuery(input.value)) // no-op
 ```
 
-Prefer arrows on class fields or AbortController for cleanup hygiene.
+Keep a stable function reference (often a named function / closure you store).
 
 ---
 
-## Auth patterns {#auth}
+## 14. Auth patterns {#auth}
 
-### Token in a closure (SPA)
+### 14.1 Token in a closure
 
 ```ts
-function createApiClient(getToken: () => string | null) {
+function createAuthClient(getToken: () => string | null) {
   return {
-    async fetch(input: RequestInfo, init: RequestInit = {}) {
+    async apiFetch(path: string) {
       const token = getToken()
-      const headers = new Headers(init.headers)
-      if (token) headers.set("Authorization", `Bearer ${token}`)
-      return fetch(input, { ...init, headers })
+      const headers: Record<string, string> = {}
+      if (token) headers.authorization = `Bearer ${token}`
+      return fetch(path, { headers })
     },
   }
 }
 
 let accessToken: string | null = null
-const api = createApiClient(() => accessToken)
-// logout: accessToken = null — client stays; capability revoked
+const client = createAuthClient(() => accessToken)
+
+accessToken = "abc"
+client.apiFetch("/me")
 ```
 
-Better than baking a string at creation time: close over a **getter** so refresh works without recreating the client.
-
-### Refresh single-flight
+`apiFetch` does not snapshot the token string forever if you pass a **getter**; it closes over `getToken`, which reads the latest token. If you closed over a string copy instead, you could go stale:
 
 ```ts
-function createAuth(refresh: () => Promise<string>) {
-  let token: string | null = null
-  let inflight: Promise<string> | null = null
-
-  async function getToken() {
-    if (token) return token
-    if (!inflight) {
-      inflight = refresh().then((t) => {
-        token = t
-        inflight = null
-        return t
+function createAuthClientStale(token: string) {
+  return {
+    apiFetch(path: string) {
+      return fetch(path, {
+        headers: { authorization: `Bearer ${token}` }, // frozen at create time
       })
-    }
-    return inflight
+    },
   }
-
-  function clear() {
-    token = null
-    inflight = null
-  }
-
-  return { getToken, clear }
 }
 ```
 
-State (`token`, `inflight`) is private via closure — classic encapsulation.
-
-### Server: signing key not on `req`
+### 14.2 Higher-order route guards
 
 ```ts
-function createJwtMiddleware(secret: string) {
-  return async (req: Request, res: Response, next: NextFunction) => {
-    const hdr = req.headers.authorization
-    if (!hdr?.startsWith("Bearer ")) {
+function withAuth(
+  handler: (req: Request, res: Response) => void,
+) {
+  return (req: Request, res: Response) => {
+    if (!(req as any).user) {
       res.status(401).end()
       return
     }
-    try {
-      // verify(hdr.slice(7), secret) — secret never attached to req
-      next()
-    } catch {
-      res.status(401).end()
-    }
+    handler(req, res)
   }
 }
 ```
 
-Closing over `secret` keeps it out of logs that dump `req`. Still: secret lives in process memory — protect heap dumps / debug endpoints.
-
-### Capability tokens as functions
+### 14.3 Curried permission checks
 
 ```ts
-type DeleteUser = (id: string) => Promise<void>
+const can =
+  (action: string) =>
+  (user: { permissions: string[] }) =>
+    user.permissions.includes(action)
 
-function makeDeleteUser(db: Db, actor: Actor): DeleteUser | null {
-  if (!actor.perms.includes("user:delete")) return null
-  return async (id) => {
-    await db.users.delete({ id, tenantId: actor.tenantId })
-  }
-}
+const canEdit = can("edit")
+canEdit({ permissions: ["edit", "view"] }) // true
 ```
 
-If you never hand out the function, the caller cannot delete — **closure as authorization**. Prefer over boolean flags when composing services.
+Each arrow adds a closed-over layer (`action`, then `user`).
 
 ---
 
-## Closures vs objects vs classes
+## 15. Closures vs objects vs classes
 
-| Approach | Privacy | Testability | Overhead |
+| Approach | Privacy | State | When it shines |
 | --- | --- | --- | --- |
-| Closure factory | true privacy | inject deps into factory | per-instance functions |
-| Class + `#private` | true privacy | prototype sharing for methods | fields on instance |
-| Class + public fields | none | easy spy | shared methods |
-| Module singleton | privacy by convention | hard to reset in tests | one env |
+| Closure factory | Strong (by default) | In lexical env | Small APIs, middleware, hooks |
+| Object / class | Public unless `#private` / convention | On `this` | Many methods, inheritance, `instanceof` |
+| Module scope | File-private | Module env | Singletons, app config |
 
 ```ts
-// class private
-class Counter {
-  #n = 0
-  inc() {
-    return ++this.#n
+// Class equivalent flavor
+class BankAccount {
+  #balance: number
+  constructor(initial: number) {
+    this.#balance = initial
+  }
+  deposit(amount: number) {
+    this.#balance += amount
+  }
+  getBalance() {
+    return this.#balance
   }
 }
 ```
 
-Prototype methods are shared; closed-over methods are per-instance. For millions of instances, class methods win memory; for few rich capabilities, closures are fine.
+Closures and classes both encapsulate. Prefer whatever your codebase already uses; be ready to translate between them in interviews.
 
 ---
 
-## Debugging closures
+## 16. Debugging closures
 
-- Chrome DevTools: Scope pane → Closure section when paused inside the function.
-- `console.dir(fn)` — not reliable for env contents.
-- Heap snapshots: search for detached HTMLElement retained by listener → closure.
-- Name functions (`function rateLimitMiddleware`) for stack traces.
+1. **Chrome DevTools:** set a breakpoint inside the inner function → Scope pane → “Closure” sections show retained bindings.
+2. **Ask:** “When was this function created?” That render / that loop iteration / that `makeX()` call owns the environment.
+3. **Stale values:** log both a closed-over variable and a ref/latest source.
+4. **Memory:** heap snapshot → retainer path often goes through a context object tied to a listener or React fiber.
+
+---
+
+## 17. Performance notes
+
+- Creating functions inside hot loops allocates many function objects + environments — sometimes measurable.
+- React: new inline handlers each render can break `memo` / pure child optimizations — not because closures are slow, but because **referential identity** changes.
+- Prefer clarity first; optimize when profiling shows allocation pressure.
+
+---
+
+## 18. Mental checklist in code review
+
+1. Does this callback outlive the function that created it? (timers, listeners, hooks)
+2. What bindings does it close over? Any large objects?
+3. Is it intentionally sharing mutable state or accidentally?
+4. In React: stale props/state risk? Missing effect deps?
+5. Can the listener/subscription be cleaned up?
+6. Would a class / explicit object make the state clearer?
+
+---
+
+## 19. Worked example — put it together
 
 ```ts
-return function rateLimitMiddleware(req, res, next) {
-  /* ... */
+type User = { id: string; name: string }
+
+function createUserService(apiBase: string) {
+  const cache = new Map<string, User>()
+
+  async function fetchUser(id: string): Promise<User> {
+    const cached = cache.get(id)
+    if (cached) return cached
+    const res = await fetch(`${apiBase}/users/${id}`)
+    const user = (await res.json()) as User
+    cache.set(id, user)
+    return user
+  }
+
+  function clearCache() {
+    cache.clear()
+  }
+
+  function getCached(id: string) {
+    return cache.get(id)
+  }
+
+  return { fetchUser, clearCache, getCached }
 }
+
+const users = createUserService("/api")
+await users.fetchUser("1")
+console.log(users.getCached("1"))
 ```
 
----
+What you used:
 
-## Performance notes
-
-- Creating a function allocates; closing over variables can prevent some optimizations / keep contexts.
-- Avoid defining heavy closures inside hot tight loops without need.
-- Don't prematurely hoist everything to module scope — clarity first; profile second.
-- V8: consistently shaped closures optimize better than megamorphic call sites.
-
----
-
-## Mental checklist in code review
-
-1. What does this function close over?  
-2. How long does the function live?  
-3. Is anything large / DOM / request-scoped in that env?  
-4. Is there a cleanup path (removeListener, effect return, clearInterval)?  
-5. Are we capturing a binding that mutates (stale vs shared state)?  
+- Factory creates a private `cache`
+- Multiple methods share one environment
+- Module-level `users` keeps that environment alive for the app lifetime
 
 ---
 
 ## Interview Questions
 
-**Q: What is a closure?**  
-A function plus the lexical environment it was defined in, retaining access to free variables after the outer function has returned.
+### Q1. What is a closure?
+**Expected:** A function paired with its lexical environment so it can access free variables even after the outer function returns.  
+**Common wrong:** “A function inside a function” (nesting alone is not the definition — retention of the environment is).  
+**Follow-ups:** What is a free variable?
 
-**Q: Do closures store values or references?**  
-Bindings (mutable references to variables), not frozen snapshots — unless you copy into a new binding.
+### Q2. Does a closure store a copy of the value or a reference to the variable?
+**Expected:** It references the binding; mutations are visible to all closures sharing that binding.  
+**Common wrong:** “Always a deep snapshot at creation.”  
+**Follow-ups:** Show two functions sharing one `let count`.
 
-**Q: Why did `var` in a loop bite people?**  
-One function-scoped binding shared by all closures; `let` creates per-iteration bindings.
+### Q3. Why does the `var` loop + closure puzzle print the same number?
+**Expected:** One shared `var` binding; after the loop it holds the final value.  
+**Common wrong:** “JavaScript is asynchronous so it forgets the index.”  
+**Follow-ups:** How do `let` / IIFE fix it?
 
-**Q: How can closures cause memory leaks?**  
-Long-lived function references (listeners, intervals, caches, module state) keep environments — and everything those environments point to — alive.
+### Q4. Can closures cause memory leaks?
+**Expected:** Yes — long-lived callbacks retaining large closed-over data or DOM nodes, especially with forgotten listeners.  
+**Common wrong:** “GC always frees outer variables immediately when the outer function returns.”  
+**Follow-ups:** How do you verify with DevTools?
 
-**Q: Closures vs private class fields?**  
-Both can encapsulate. Closures: per-function env, great for factories/middleware. `#fields`: clearer OOP shape, shared prototype methods.
+### Q5. What is a stale closure in React?
+**Expected:** A handler/effect closes over props/state from an earlier render and does not see updates.  
+**Common wrong:** “React does not use closures.”  
+**Follow-ups:** Fixes: functional `setState`, refs, correct effect dependencies.
 
-**Q: What is a stale closure in React?**  
-A callback/effect that captured an old binding because dependencies weren't updated; reads outdated props/state.
+### Q6. How do Express middleware factories use closures?
+**Expected:** Outer function takes config (`role`, `limit`); returned middleware closes over that config/state.  
+**Common wrong:** Only describing `app.use(fn)` without the factory layer.  
+**Follow-ups:** Risks of shared mutable maps in middleware?
 
-**Q: How does Express middleware use closures?**  
-Factories close over config and shared state; returned `(req,res,next)` is the closure used for every request.
-
-**Q: Can you GC part of a closed-over environment?**  
-Not something to rely on; if the env is reachable, treat sibling bindings as potentially retained. Structure code so large data isn't in the same env as long-lived tiny captures.
-
-**Q: Difference between closing over `this` with arrow vs `function`?**  
-Arrow lexical `this`; classic `function` gets `this` from the call site and does not close over `this` as a variable.
-
-**Q: Module scope — is that a closure?**  
-Top-level functions close over the module environment. The module env is a long-lived "closure space."
+### Q7. Closures vs private class fields?
+**Expected:** Both encapsulate; closures use lexical environments; classes use per-instance private slots / methods with `this`.  
+**Common wrong:** “Classes cannot do privacy.”  
+**Follow-ups:** When would you pick one?
 
 ## Common Mistakes
 
-- Assuming closures deep-copy closed values.
-- Forgetting to remove event listeners / clear intervals.
-- Empty React dep arrays with used props/state.
-- Closing over entire `req`/`res` or large props when only one field is needed.
-- Unbounded Maps inside middleware factories (rate limit by IP without eviction).
-- Creating new closures every render without memoization when referential equality matters (context providers).
-- Using `var` in async loops.
-- Logging secrets held in closures via accidental `util.inspect` on rich objects.
+- Defining closure as “nested function” without environment retention.
+- Assuming closed-over primitives are snapshotted and immune to later assignment to the **same binding**.
+- Creating listeners with inline arrows and failing to remove them.
+- React empty-deps effects that capture initial state forever.
+- Closing over huge objects “just in case” in long-lived callbacks.
+- Sharing one mutable closure state across requests without bounds (rate limiter Map growth).
+- Thinking the outer function remains on the call stack while the closure lives.
 
 ## Trade-offs / Production Notes
 
-- Prefer **short-lived** closures for request handlers; put multi-gb caches in dedicated stores with TTL (Redis) — see [Redis](/backend/05-redis).
-- Auth: close over getters / refresh logic, not forever-fixed tokens.
-- React: understand stale closures before adding refs everywhere — deps are usually the right fix.
-- Memory: pair every `addEventListener` / `subscribe` with disposal; AbortController scales well.
-- Related: [Scope](/javascript/03-scope), [this](/javascript/06-this), [Event Loop](/javascript/10-event-loop), [Memory](/javascript/12-memory), [Node event loop](/node/02-event-loop).
+- Closures are the backbone of callbacks, hooks, middleware, and module privacy — use them deliberately.
+- For long-lived subscriptions, pair every registration with cleanup.
+- In React, treat “which render created this function?” as a first-class question.
+- Prefer passing getters / refs when you need **latest** values inside long-lived closures.
+- Related: [Scope](/javascript/03-scope), [Execution Context](/javascript/02-execution-context), [Memory](/javascript/12-memory), [`this`](/javascript/06-this), [Modules](/javascript/13-modules), [Async](/javascript/11-async), [Event Loop](/javascript/10-event-loop).
+
+## Appendix — whiteboard script
+
+Draw and narrate:
+
+```text
+makeMultiplier(2)
+  └─ environment { factor: 2 }
+        ↑
+   multiply ƒ  [[Environment]]
+
+Call multiply(5):
+  local n = 5
+  read factor from closed env → 2
+  return 10
+```
+
+Then redraw the `var` loop with **one** box for `i`, vs `let` with **three** boxes.
 
 ---
 
-## Appendix — closure interview whiteboard
+## Appendix B — closure vs object side by side
 
-Draw three boxes:
-
-1. **Function object** — code + `[[Environment]]` pointer  
-2. **Environment record** — slots (`n`, `user`, `secret`)  
-3. **Outer link** — chain to module/global  
-
-Then narrate a leak: DOM root → listener → env → large panel. Cut the edge with `removeEventListener` / `AbortController`.
-
-### Snapshot vs binding (force the distinction)
+Same behavior, two styles:
 
 ```ts
-function snap() {
-  let n = 0
-  const frozen = n // copy value now
+// Closures
+function createPoint(x: number, y: number) {
   return {
-    live: () => ++n,
-    snap: () => frozen,
-    get: () => n,
-  }
-}
-const s = snap()
-s.live()
-s.get() // 1
-s.snap() // 0
-```
-
-### Once / memoize via closure
-
-```ts
-function once<F extends (...args: any[]) => any>(fn: F): F {
-  let called = false
-  let result: ReturnType<F>
-  return function (this: unknown, ...args: any[]) {
-    if (!called) {
-      called = true
-      result = fn.apply(this, args)
-    }
-    return result
-  } as F
-}
-```
-
-### Pub/sub with private subscribers
-
-```ts
-function createEmitter<T>() {
-  const subs = new Set<(v: T) => void>()
-  return {
-    subscribe(fn: (v: T) => void) {
-      subs.add(fn)
-      return () => {
-        subs.delete(fn)
-      }
-    },
-    emit(v: T) {
-      for (const fn of subs) fn(v)
+    getX: () => x,
+    getY: () => y,
+    move(dx: number, dy: number) {
+      x += dx
+      y += dy
     },
   }
 }
-```
 
-`subs` is unreachable except through the returned API — classic module/factory encapsulation.
-
-### React Query / SWR style stale-while-revalidate (closure cache)
-
-```ts
-function createSWR<T>(key: string, loader: () => Promise<T>) {
-  let data: T | undefined
-  let inflight: Promise<T> | null = null
-  const listeners = new Set<(v: T) => void>()
-
-  async function revalidate() {
-    if (!inflight) {
-      inflight = loader().then((v) => {
-        data = v
-        inflight = null
-        listeners.forEach((l) => l(v))
-        return v
-      })
-    }
-    return inflight
+// Object / class fields
+class Point {
+  constructor(
+    private x: number,
+    private y: number,
+  ) {}
+  getX() {
+    return this.x
   }
-
-  return {
-    getSnapshot: () => data,
-    subscribe: (l: (v: T) => void) => {
-      listeners.add(l)
-      return () => {
-        listeners.delete(l)
-      }
-    },
-    revalidate,
+  getY() {
+    return this.y
+  }
+  move(dx: number, dy: number) {
+    this.x += dx
+    this.y += dy
   }
 }
 ```
 
-Same shape as many client caches — closures hold `data` / `inflight` / `listeners` for the lifetime of the store.
+Interview angle: closures hide state without exposing `this` binding issues; classes share methods on the prototype and use private fields for encapsulation. Both are valid — pick based on codebase conventions.
 
-### Express: compose middleware with closed-over logger
+---
+
+## Appendix C — stale closure mini-lab (predict, then fix)
 
 ```ts
-function withRequestId(generate = () => crypto.randomUUID()) {
-  return (req: any, res: any, next: any) => {
-    const id = generate()
-    req.id = id
-    res.setHeader("x-request-id", id)
-    const log = (...args: unknown[]) => console.log(id, ...args)
-    req.log = log
-    next()
+function createPlayer() {
+  let score = 0
+
+  function add(n: number) {
+    score += n
   }
+
+  function bonusLater() {
+    setTimeout(() => {
+      add(10)
+      console.log("score", score)
+    }, 0)
+  }
+
+  function resetBroken() {
+    score = 0
+    // Does the pending timeout see 0 or keep going from old value?
+    // Same binding — it sees the live `score`. reset affects it.
+  }
+
+  return { add, bonusLater, getScore: () => score, resetBroken }
 }
+
+const p = createPlayer()
+p.add(5)
+p.bonusLater()
+p.resetBroken()
+// timeout still runs against the SAME score binding → logs 10 (0+10), not 15
 ```
 
-Each request gets a `log` closure over that request's `id` — no AsyncLocalStorage required for the simple case (ALS still better for deep call stacks — know both).
+Contrast with React render snapshots: each render can create a **new** `count` binding in a new function instance. Module/factory `let score` is one long-lived binding. Knowing **which binding** you closed over is the whole skill.
 
-### Event listener + React cleanup pairing
+---
 
-```tsx
-useEffect(() => {
-  const ac = new AbortController()
-  const onKey = (e: KeyboardEvent) => {
-    if (e.key === "Escape") onClose()
-  }
-  window.addEventListener("keydown", onKey, { signal: ac.signal })
-  return () => ac.abort()
-}, [onClose])
-```
+## Appendix D — when NOT to use a closure
 
-If `onClose` is unstable, effect re-runs often — wrap `onClose` in `useCallback` or read from a ref to avoid churn while still closing over the latest behavior.
+1. The state needs to be inspected/serialized (prefer plain objects).
+2. Many instances each with huge method sets (class prototype sharing may be clearer/cheaper).
+3. You need inheritance hierarchies (classes/`extends`).
+4. The “closed over” value should update from outside without shared mutable binding — pass parameters explicitly instead.
+
+Closures are a tool, not a default for every piece of state.

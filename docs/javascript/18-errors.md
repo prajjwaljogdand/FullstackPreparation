@@ -1,35 +1,183 @@
-# Error Handling
+# Errors
 
-Error types, `try/catch/finally`, async rejection paths, custom errors, and production patterns seniors are expected to describe.
+This chapter teaches error handling from scratch: what an `Error` is, how `try` / `catch` / `finally` run, how to build custom errors, how async failures differ from sync throws, what “Error Boundaries” mean in UI frameworks, and how errors propagate in Node. You do not need prior experience with stacks or rejection handling. By the end you should be able to design a clear failure path for both sync and async code.
 
-## `Error` and subclasses
+---
+
+## 1. What is an “error” in a program?
+
+Sometimes an operation cannot continue meaningfully:
+
+- A file is missing
+- JSON is malformed
+- The user is not authenticated
+- A network request fails
+
+An **exception** is a way to **stop the normal path** and jump to a handler that knows what to do (retry, show a message, abort).
+
+In JavaScript you **throw** a value (usually an `Error` object). Something up the call stack may **catch** it. If nothing catches it, the program (or the current async turn) fails loudly.
 
 ```ts
-new Error("msg")
-new TypeError("expected number")
-new RangeError("index out of bounds")
-new SyntaxError("…") // usually thrown by engine/parser
-new URIError("…")
-new AggregateError([e1, e2], "multiple") // Promise.any failures, etc.
+throw new Error("something went wrong")
 ```
+
+```mermaid
+flowchart TB
+  A["function A calls B"] --> B["B calls C"]
+  B --> C["C throws"]
+  C -.->|"unwind stack"| B
+  B -.->|"still no catch"| A
+  A --> catch["catch handler / crash"]
+```
+
+---
+
+## 2. The `Error` object — anatomy
 
 ```ts
 const err = new Error("fail")
-err.name        // "Error"
-err.message     // "fail"
-err.stack       // engine-dependent stack string
-err.cause       // ES2022 — wrap underlying error
+err.name     // "Error"
+err.message  // "fail"
+err.stack    // string stack trace (engine-dependent)
+err.cause    // optional underlying error (ES2022)
+```
+
+Built-in subclasses you will see:
+
+| Type | Typical meaning |
+| --- | --- |
+| `Error` | Generic |
+| `TypeError` | Wrong type / bad method call |
+| `RangeError` | Number out of allowed range |
+| `SyntaxError` | Invalid syntax (often from `JSON.parse`, parsers) |
+| `URIError` | Bad `encodeURI` / `decodeURI` usage |
+| `AggregateError` | Multiple errors together (`Promise.any`, etc.) |
+
+```ts
+JSON.parse("{") // SyntaxError
+;(null as unknown as { x: 1 }).x // TypeError at runtime
 ```
 
 ```mermaid
 classDiagram
   Error <|-- TypeError
   Error <|-- RangeError
+  Error <|-- SyntaxError
   Error <|-- AggregateError
-  Error <|-- CustomAppError
+  Error <|-- AppError
 ```
 
-## Custom errors
+Always prefer throwing `Error` (or subclass) over throwing raw strings — stacks and tooling expect objects with `message` / `name`.
+
+```ts
+throw "nope"          // works, but hostile to debugging
+throw new Error("nope") // do this
+```
+
+---
+
+## 3. `try` / `catch` / `finally` — teaching the control flow
+
+### 3.1 Basic shape
+
+```ts
+try {
+  // risky work
+} catch (e) {
+  // handle failure
+} finally {
+  // always runs (cleanup)
+}
+```
+
+Plain language:
+
+1. Run `try`.
+2. If something is thrown, skip the rest of `try` and run `catch`.
+3. Whether success or failure, run `finally` (if present).
+4. Then continue after the whole block — unless `catch`/`finally` rethrows or returns in a tricky way.
+
+### 3.2 Walkthrough with return
+
+```ts
+function example(fail: boolean): string {
+  try {
+    if (fail) throw new Error("boom")
+    return "ok"
+  } catch (e) {
+    return "caught"
+  } finally {
+    console.log("cleanup")
+  }
+}
+
+example(false) // logs "cleanup", returns "ok"
+example(true)  // logs "cleanup", returns "caught"
+```
+
+`finally` runs **even if** `try` or `catch` returns. Cleanup belongs here (close files, release locks, hide spinners).
+
+### 3.3 `finally` can override a return (gotcha)
+
+```ts
+function f() {
+  try {
+    return 1
+  } finally {
+    return 2 // this wins — usually a mistake
+  }
+}
+f() // 2
+```
+
+Do not return from `finally` unless you are deliberately forcing a result. Prefer cleanup only.
+
+### 3.4 Catch binding
+
+```ts
+try {
+  throw new Error("x")
+} catch (e) {
+  // e is unknown in TypeScript — narrow it
+  if (e instanceof Error) {
+    console.error(e.message)
+  } else {
+    console.error(String(e))
+  }
+}
+```
+
+Optional catch binding (when you do not need the value):
+
+```ts
+try {
+  risky()
+} catch {
+  fallback()
+}
+```
+
+---
+
+## 4. Custom errors — teach a real pattern
+
+### 4.1 Why custom errors?
+
+So callers can **branch on kind**:
+
+```ts
+if (e instanceof NotFoundError) {
+  return notFoundPage()
+}
+if (e instanceof AuthError) {
+  redirectToLogin()
+}
+throw e // unknown — let it propagate
+```
+
+Strings or ad-hoc `{ code: 404 }` objects do not compose as well with `instanceof` and stacks.
+
+### 4.2 Implementation
 
 ```ts
 class AppError extends Error {
@@ -40,7 +188,7 @@ class AppError extends Error {
   ) {
     super(message, options)
     this.name = "AppError"
-    // restore prototype chain when targeting ES5-ish runtimes:
+    // Helps when targeting older downlevel compiles:
     Object.setPrototypeOf(this, new.target.prototype)
   }
 }
@@ -56,14 +204,54 @@ class HttpError extends AppError {
   }
 }
 
-throw new HttpError(404, "Not found", "NOT_FOUND")
+class NotFoundError extends HttpError {
+  constructor(message = "Not found") {
+    super(404, message, "NOT_FOUND")
+    this.name = "NotFoundError"
+  }
+}
+
+throw new NotFoundError("User missing")
 ```
 
-Use `instanceof` carefully across realms/iframes (different globals) — duck-type `code` / `name` at boundaries.
+### 4.3 `cause` for wrapping
 
-## `try` / `catch` / `finally`
+Wrap lower-level failures without losing the original:
 
 ```ts
+try {
+  JSON.parse(raw)
+} catch (e) {
+  throw new AppError("Invalid config JSON", "CONFIG", { cause: e })
+}
+```
+
+Debuggers and logs can show the chain: outer message + inner `SyntaxError`.
+
+### 4.4 Realm / iframe caveat
+
+`instanceof Error` can fail across iframes (different global `Error` constructors). At boundaries, duck-type:
+
+```ts
+function isAppError(e: unknown): e is AppError {
+  return (
+    typeof e === "object" &&
+    e !== null &&
+    "code" in e &&
+    typeof (e as { code: unknown }).code === "string"
+  )
+}
+```
+
+---
+
+## 5. Sync example — resources and wrapping
+
+```ts
+declare function open(path: string): number
+declare function load(fd: number): string
+declare function close(fd: number): void
+
 function readConfig(path: string): string {
   let fd: number | undefined
   try {
@@ -73,168 +261,396 @@ function readConfig(path: string): string {
     if (e instanceof AppError) throw e
     throw new AppError("config read failed", "CONFIG", { cause: e })
   } finally {
-    if (fd !== undefined) close(fd) // always runs
+    if (fd !== undefined) close(fd)
   }
 }
 ```
 
-`finally` runs on return/throw from `try`/`catch`. A `return` inside `finally` **overrides** the try return (anti-pattern).
+Teaching points:
 
-## Async: rejections are not `catch`ed by sync try
+- `finally` closes the file even when `load` throws
+- Unknown errors get wrapped with context; known `AppError`s pass through
+
+---
+
+## 6. Async errors — the part people miss
+
+### 6.1 `throw` inside `async` becomes rejection
+
+```ts
+async function loadUser(id: string) {
+  if (!id) throw new Error("id required") // rejects the returned Promise
+  const res = await fetch(`/api/users/${id}`)
+  if (!res.ok) throw new HttpError(res.status, "fetch failed")
+  return res.json()
+}
+```
+
+Callers must handle the Promise:
 
 ```ts
 try {
-  Promise.reject(new Error("nope")) // unhandled unless .catch / await
-} catch {
-  // does NOT run
+  const user = await loadUser("1")
+  console.log(user)
+} catch (e) {
+  console.error(e)
 }
 
-try {
-  await Promise.reject(new Error("nope"))
-} catch (e) {
-  // runs
+// or
+loadUser("1").catch((e) => console.error(e))
+```
+
+### 6.2 `try/catch` does **not** catch async work you forgot to await
+
+```ts
+async function broken() {
+  try {
+    loadUser("1") // forgot await — returns a Promise, try succeeds immediately
+  } catch (e) {
+    // will NOT catch loadUser's failure
+  }
+}
+```
+
+```ts
+async function fixed() {
+  try {
+    await loadUser("1")
+  } catch (e) {
+    // catches rejection
+  }
 }
 ```
 
 ```mermaid
-flowchart TD
-  sync["throw in sync"] --> catch["catch"]
-  rej["rejected Promise"] --> micro["microtask"]
-  micro --> handler["await try/catch or .catch"]
-  micro --> unhandled["unhandledrejection"]
+sequenceDiagram
+  participant Caller
+  participant AsyncFn
+  participant Fetch
+  Caller->>AsyncFn: await loadUser()
+  AsyncFn->>Fetch: fetch
+  Fetch-->>AsyncFn: fail
+  AsyncFn-->>Caller: rejected Promise
+  Caller->>Caller: catch
 ```
 
-### Fire-and-forget
+### 6.3 Floating promises
 
 ```ts
-void save().catch((e) => logger.error(e)) // explicit
-// bare save() → unhandledrejection risk
+loadUser("1") // no await, no .catch — rejection may become "unhandledRejection"
 ```
 
-## Pattern: Result types vs exceptions
+Always either:
 
-```ts
-type Result<T, E = AppError> =
-  | { ok: true; value: T }
-  | { ok: false; error: E }
+- `await` in an async function with `try/catch`, or
+- `.catch(...)`, or
+- pass to a helper that logs (`void loadUser().catch(log)`)
 
-function parseAge(raw: string): Result<number> {
-  const n = Number(raw)
-  if (!Number.isInteger(n) || n < 0) {
-    return { ok: false, error: new AppError("bad age", "VALIDATION") }
-  }
-  return { ok: true, value: n }
-}
-```
-
-| Approach | Use when |
-| --- | --- |
-| Exceptions | Truly unexpected / non-local abort |
-| Result / error codes | Expected failure (validation, not-found) |
-| Events / callbacks | Streaming / multi-error surfaces |
-
-## Promise combinators & errors
-
-```ts
-await Promise.all([a, b])        // fail-fast first rejection
-await Promise.allSettled([a, b]) // never rejects — inspect statuses
-await Promise.any([a, b])        // rejects AggregateError if all fail
-await Promise.race([a, b])       // first settle (fulfill or reject)
-```
-
-Implementations: [Machine Coding](/javascript/23-machine-coding).
-
-## Global handlers (browser / Node)
-
-```ts
-// Browser
-window.addEventListener("error", (ev) => {
-  logger.error(ev.error ?? ev.message)
-})
-window.addEventListener("unhandledrejection", (ev) => {
-  logger.error(ev.reason)
-  // ev.preventDefault() sparingly
-})
-
-// Node
-process.on("uncaughtException", (e) => { /* log & exit — process is unstable */ })
-process.on("unhandledRejection", (reason) => { /* log; treat as crash in strict apps */ })
-```
-
-Production Node: prefer crash + restart on unknown state over continuing after `uncaughtException`.
-
-## Operational vs programmer errors
-
-```ts
-// Operational: network down, 429, disk full → handle, retry, degrade
-// Programmer: undefined is not a function → fix code, fail loud in prod with telemetry
-```
-
-Don't swallow:
+### 6.4 `Promise.all` vs `allSettled`
 
 ```ts
 try {
-  await work()
-} catch {
-  // silent — production nightmare
-}
+  await Promise.all([a(), b()]) // fails fast on first rejection
+} catch (e) { /* first failure */ }
+
+const results = await Promise.allSettled([a(), b()])
+// each result is { status: "fulfilled", value } | { status: "rejected", reason }
 ```
 
-## Error serialization
+`AggregateError` appears with `Promise.any` when **all** fail.
 
-```ts
-JSON.stringify(new Error("x")) // "{}"  — message not enumerable historically
-```
+---
 
-Log explicitly:
+## 7. Error Boundaries — the UI idea (React-oriented)
 
-```ts
-function serializeError(e: unknown) {
-  if (e instanceof Error) {
-    return {
-      name: e.name,
-      message: e.message,
-      stack: e.stack,
-      cause: e.cause ? serializeError(e.cause) : undefined,
-      ...(e instanceof AppError ? { code: e.code } : {}),
-    }
+Backend/services catch errors in handlers. **UI trees** need a similar idea: if one widget crashes while rendering, do not blank the whole page.
+
+In React, an **Error Boundary** is a component that catches **render / lifecycle** errors in its children and shows a fallback UI.
+
+```tsx
+import { Component, type ErrorInfo, type ReactNode } from "react"
+
+type Props = { children: ReactNode; fallback: ReactNode }
+type State = { hasError: boolean }
+
+class ErrorBoundary extends Component<Props, State> {
+  state: State = { hasError: false }
+
+  static getDerivedStateFromError(): State {
+    return { hasError: true }
   }
-  return { message: String(e) }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error("UI crash", error, info.componentStack)
+    // report to logging service
+  }
+
+  render() {
+    if (this.state.hasError) return this.props.fallback
+    return this.props.children
+  }
+}
+
+// usage
+;<ErrorBoundary fallback={<p>Something went wrong.</p>}>
+  <ProfilePage />
+</ErrorBoundary>
+```
+
+Critical limits (interview favorite):
+
+- Error Boundaries catch errors in **render**, constructors, and lifecycle methods of children.
+- They do **not** catch errors inside **event handlers**, **async code**, or **SSR** the same way — handle those with local `try/catch` / `.catch`.
+- React 18+ / frameworks may have additional recovery APIs; the **idea** stays: isolate failure domains in the tree.
+
+```mermaid
+flowchart TB
+  App --> Boundary
+  Boundary --> Page
+  Page --> Widget
+  Widget -->|"throw during render"| Boundary
+  Boundary --> Fallback["fallback UI"]
+```
+
+---
+
+## 8. Node.js: how errors propagate
+
+### 8.1 Sync throw
+
+Same as browsers: bubbles up the stack until `catch` or crashes the process (depending on environment / hooks).
+
+### 8.2 Callback style (legacy)
+
+```js
+fs.readFile("x.txt", (err, data) => {
+  if (err) {
+    // handle — do not throw blindly inside without listener
+    return void console.error(err)
+  }
+  console.log(data)
+})
+```
+
+Convention: **first argument is `Error | null`**.
+
+### 8.3 Promises / async
+
+Unhandled rejections:
+
+```ts
+process.on("unhandledRejection", (reason) => {
+  console.error("unhandledRejection", reason)
+  // In modern Node, unhandled rejections may terminate the process
+})
+```
+
+Also:
+
+```ts
+process.on("uncaughtException", (err) => {
+  console.error("uncaughtException", err)
+  // Log, then exit — process may be in unknown state
+  process.exit(1)
+})
+```
+
+Production guidance:
+
+- Treat `uncaughtException` as **fatal** — log and exit; do not keep serving traffic casually.
+- Prefer catching at request boundaries (HTTP handler) so one bad request does not kill the server.
+
+### 8.4 Express-style request boundary (sketch)
+
+```ts
+app.get("/user/:id", async (req, res, next) => {
+  try {
+    const user = await loadUser(req.params.id)
+    res.json(user)
+  } catch (e) {
+    next(e) // pass to error middleware
+  }
+})
+
+app.use((err: unknown, _req, res, _next) => {
+  if (err instanceof NotFoundError) {
+    return res.status(404).json({ error: err.message, code: err.code })
+  }
+  console.error(err)
+  res.status(500).json({ error: "Internal error" })
+})
+```
+
+Map known domain errors to status codes; hide internals from clients.
+
+---
+
+## 9. Logging and user-facing messages
+
+Separate three layers:
+
+| Layer | Example |
+| --- | --- |
+| User message | “Could not save. Try again.” |
+| App code / error code | `SAVE_FAILED` |
+| Internal detail / stack | logged to Sentry, not shown |
+
+```ts
+function toClientError(e: unknown): { status: number; body: object } {
+  if (e instanceof HttpError) {
+    return { status: e.status, body: { code: e.code, message: e.message } }
+  }
+  console.error(e) // full detail server-side
+  return { status: 500, body: { code: "INTERNAL", message: "Something went wrong" } }
 }
 ```
+
+Never leak stack traces or DB strings to end users in production.
+
+---
+
+## 10. Patterns: fail fast, recover, or wrap
+
+```ts
+// Fail fast — bad input
+function sqrt(n: number) {
+  if (n < 0) throw new RangeError("n must be ≥ 0")
+  return Math.sqrt(n)
+}
+
+// Recover — optional path
+function parseJsonSafe(raw: string): unknown | null {
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return null
+  }
+}
+
+// Wrap — add context at boundaries
+async function loadSettings() {
+  try {
+    return await fetchSettings()
+  } catch (e) {
+    throw new AppError("settings unavailable", "SETTINGS", { cause: e })
+  }
+}
+```
+
+Empty `catch` that swallows everything is almost always wrong:
+
+```ts
+try {
+  await save()
+} catch {
+  // silent — future you will hate this
+}
+```
+
+At minimum log; usually rethrow or return a Result type.
+
+---
+
+## 11. Result types (alternative to exceptions)
+
+Some codebases prefer explicit outcomes:
+
+```ts
+type Result<T, E = Error> =
+  | { ok: true; value: T }
+  | { ok: false; error: E }
+
+function divide(a: number, b: number): Result<number, AppError> {
+  if (b === 0) return { ok: false, error: new AppError("div by zero", "MATH") }
+  return { ok: true, value: a / b }
+}
+
+const r = divide(10, 0)
+if (!r.ok) {
+  console.error(r.error.code)
+} else {
+  console.log(r.value)
+}
+```
+
+Trade-off: more verbose, but control flow stays visible; no surprise throws. Exceptions still shine for truly exceptional / deep stack failures.
+
+---
+
+## 12. Worked end-to-end story
+
+```ts
+class ValidationError extends AppError {
+  constructor(message: string) {
+    super(message, "VALIDATION")
+    this.name = "ValidationError"
+  }
+}
+
+async function createUser(input: unknown) {
+  if (typeof input !== "object" || input === null || !("email" in input)) {
+    throw new ValidationError("email required")
+  }
+  const email = String((input as { email: unknown }).email)
+  try {
+    return await db.user.create({ email })
+  } catch (e) {
+    throw new AppError("db create failed", "DB", { cause: e })
+  }
+}
+
+async function handler(body: unknown) {
+  try {
+    const user = await createUser(body)
+    return { status: 201, body: user }
+  } catch (e) {
+    if (e instanceof ValidationError) {
+      return { status: 400, body: { code: e.code, message: e.message } }
+    }
+    console.error(e)
+    return { status: 500, body: { code: "INTERNAL", message: "Failed" } }
+  }
+}
+```
+
+---
 
 ## Interview Questions
 
-**Q: Does `try/catch` catch rejected promises?**  
-Only if the rejection is `await`ed inside the try (or you `.catch`). Sync `try` around `promise` creation does not.
+### Q1. What does `finally` guarantee?
+**Expected:** It runs after `try`/`catch` whether the try succeeded, threw, or returned — used for cleanup.  
+**Common wrong:** “Only runs on errors.”  
+**Follow-ups:** What if `finally` itself throws? (It propagates; can mask earlier errors.)
 
-**Q: What is `error.cause`?**  
-Standard way to chain errors without hacking `.original` — preserves underlying stack context.
+### Q2. How do you make a custom error?
+**Expected:** `class X extends Error`, set `name`, pass `message` to `super`, optionally `cause` / custom fields like `code`.  
 
-**Q: `Promise.all` vs `allSettled` for error handling?**  
-`all` aborts on first failure; `allSettled` waits for all — better for batch jobs that should report every failure.
+### Q3. Does `try/catch` catch async errors?
+**Expected:** Only if you `await` the promise (or use `.catch`). Forgetting `await` leaves a floating rejection.  
 
-**Q: Should Node process continue after uncaughtException?**  
-Generally no — state may be corrupt; log, flush, exit, let supervisor restart.
+### Q4. What is an Error Boundary?
+**Expected:** UI component that catches render/lifecycle errors in children and shows fallback; does not replace handling in events/async.  
 
-**Q: Why custom error classes?**  
-Stable `code` for clients, `instanceof` branching, metrics by type, hide internal messages.
+### Q5. `uncaughtException` in Node — keep running?
+**Expected:** Generally no — log and exit; state may be corrupt. Catch at boundaries instead.  
 
-**Q: What does `finally` guarantee?**  
-Runs on leave from try/catch whether return or throw — use for cleanup (but prefer `using`/disposers where available).
+### Q6. Why not `throw "string"`?
+**Expected:** Loses structured `name`/`stack` conventions; harder to `instanceof` and log consistently.  
 
 ## Common Mistakes
 
-- Empty `catch` blocks.
-- Catching to log and rethrow incorrectly (losing stack) — use `cause`.
-- Treating validation failures as 500s (or vice versa).
-- Assuming `err.message` is safe to show to end users (info leak).
-- Forgetting `AggregateError.errors`.
-- Using `throw "string"` — breaks `instanceof Error` tooling.
+- Empty `catch` blocks that swallow failures.
+- Catching too broadly and hiding bugs.
+- Forgetting `await` inside `try`.
+- Returning from `finally` and overriding real results.
+- Showing stack traces to end users.
+- Using Error Boundaries for event-handler failures (they will not catch them).
+- Mixing callback `err` style with throws inconsistently in Node.
 
 ## Trade-offs / Production Notes
 
-- Map domain errors → HTTP status at the edge; keep core free of HTTP types when possible.
-- Sample / rate-limit error telemetry to avoid cascades.
-- User-facing messages ≠ log messages.
-- Related: [Async](/javascript/11-async), [Machine Coding](/javascript/23-machine-coding), [Node production](/node/13-production), [Observability](/backend/09-observability).
+- **Exceptions** for exceptional paths; **Result types** when failures are common and local.
+- Centralize mapping of domain errors → HTTP/UI at the **boundary**, not in every helper.
+- Instrument with `cause` chains and a logging service (Sentry, etc.).
+- In React, place Error Boundaries around independent panels so one crash does not take the whole app.
+- Related: [Async](/javascript/11-async), [Event Loop](/javascript/10-event-loop), [Modules](/javascript/13-modules), machine-coding error UX in forms.

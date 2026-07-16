@@ -8,15 +8,15 @@ Render only the **visible window** (+ overscan) of a long list. Interviewers wan
 
 - Fixed-height rows first (variable height as stretch)
 - Vertical windowing with overscan
-- Correct scrollbar size (spacer / total height)
-- `scrollToIndex(i)` optional API
+- Correct scrollbar size (total height spacer)
+- Optional `scrollToIndex(i)`
 - Stable item keys
 
 ### Non-functional
 
 - O(visible) DOM nodes for N = 10k–100k
 - 60fps scroll on mid hardware
-- No layout thrash (read scroll in `requestAnimationFrame` if needed)
+- Batch scroll updates with `requestAnimationFrame`
 
 ### Clarify
 
@@ -32,20 +32,8 @@ flowchart TB
   Calc --> Start[startIndex]
   Calc --> End[endIndex]
   Start --> Slice[items slice + overscan]
-  Slice --> Inner["Absolute / translate positioned rows"]
+  Slice --> Inner[translateY positioned rows]
   Calc --> Phantom[Total height spacer]
-```
-
-```mermaid
-flowchart LR
-  subgraph viewport
-    direction TB
-    PadTop[padding / offsetY]
-    RowA[Row i]
-    RowB[Row i+1]
-    RowC[Row i+2]
-    PadBot[remaining space via parent height]
-  end
 ```
 
 ## Complete implementation (fixed row height)
@@ -65,7 +53,7 @@ import {
 export type VirtualListProps<T> = {
   items: T[]
   rowHeight: number
-  height: number // viewport px
+  height: number
   width?: number | string
   overscan?: number
   getKey: (item: T, index: number) => string | number
@@ -99,15 +87,8 @@ export function VirtualList<T>({
   const { start, end, offsetY } = useMemo(() => {
     const startIndex = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan)
     const visibleCount = Math.ceil(height / rowHeight)
-    const endIndex = Math.min(
-      items.length,
-      startIndex + visibleCount + overscan * 2,
-    )
-    return {
-      start: startIndex,
-      end: endIndex,
-      offsetY: startIndex * rowHeight,
-    }
+    const endIndex = Math.min(items.length, startIndex + visibleCount + overscan * 2)
+    return { start: startIndex, end: endIndex, offsetY: startIndex * rowHeight }
   }, [scrollTop, rowHeight, height, overscan, items.length])
 
   const slice = items.slice(start, end)
@@ -116,12 +97,7 @@ export function VirtualList<T>({
     <div
       role="list"
       onScroll={onScroll}
-      style={{
-        height,
-        width,
-        overflow: 'auto',
-        position: 'relative',
-      }}
+      style={{ height, width, overflow: 'auto', position: 'relative' }}
     >
       <div style={{ height: totalHeight, position: 'relative' }}>
         <div
@@ -135,10 +111,7 @@ export function VirtualList<T>({
         >
           {slice.map((item, i) => {
             const index = start + i
-            const style: CSSProperties = {
-              height: rowHeight,
-              boxSizing: 'border-box',
-            }
+            const style: CSSProperties = { height: rowHeight, boxSizing: 'border-box' }
             return (
               <div role="listitem" key={getKey(item, index)} style={style}>
                 {renderRow(item, index)}
@@ -150,8 +123,6 @@ export function VirtualList<T>({
     </div>
   )
 }
-
-// ─── Demo ────────────────────────────────────────────────────────────
 
 type Row = { id: number; label: string }
 
@@ -168,7 +139,9 @@ export function BigListDemo() {
       height={400}
       overscan={5}
       getKey={(r) => r.id}
-      renderRow={(r) => <div style={{ padding: '0 8px', lineHeight: '36px' }}>{r.label}</div>}
+      renderRow={(r) => (
+        <div style={{ padding: '0 8px', lineHeight: '36px' }}>{r.label}</div>
+      )}
     />
   )
 }
@@ -187,80 +160,54 @@ export function scrollToIndex(
 }
 ```
 
-## Stretch: variable height (estimated)
+### Stretch: variable height
 
-```tsx
-/**
- * Strategy:
- * - Keep `estimates[i]` (defaultEstimate)
- * - Measure mounted rows via ResizeObserver / ref callback
- * - Maintain prefix sums for O(log n) offset lookup (or Fenwick)
- * - On measure correction, adjust scrollTop if measurement is above viewport
- */
-type Metrics = {
-  estimated: number
-  measured: Map<number, number>
-  prefix: number[] // lazy rebuild
-}
-
-function getOffset(metrics: Metrics, index: number, fallback: number): number {
-  let y = 0
-  for (let i = 0; i < index; i++) {
-    y += metrics.measured.get(i) ?? fallback
-  }
-  return y
-}
-```
-
-In interviews, state the approach; full dynamic virtualizers (TanStack Virtual) are large — fixed height usually suffices.
+Keep per-index estimates, measure mounted rows (`ResizeObserver`), maintain prefix sums (or Fenwick) for offset lookup; correct `scrollTop` when a measurement above the viewport changes. In interviews, state the approach — full dynamic virtualizers are large.
 
 ## Edge cases
 
 | Case | Handling |
 | --- | --- |
-| Empty list | Total height 0; no rows |
-| `scrollTop` beyond new shorter list | Clamp on items length change |
-| Overscan 0 | Possible white flash; use ≥2–5 |
-| Subpixel rounding | Prefer integer heights; floor/ceil carefully |
-| Focus into offscreen row | `scrollToIndex` before focus |
-| Window resize | Recompute visible count from new `height` |
-| Horizontal overflow | Separate x virtualization or CSS |
+| Empty list | Total height 0 |
+| List shrinks | Clamp `scrollTop` |
+| Overscan 0 | White flash — use ≥2–5 |
+| Subpixel rounding | Prefer integer heights |
+| Focus offscreen row | `scrollToIndex` first |
+| Resize viewport | Recompute visible count |
+| Padding on container | Include in scroll math |
 
 ## Follow-up interview questions
 
 1. Why not render 50k `<div>`s?
 2. How does overscan help?
-3. Fixed vs variable height — data structures?
-4. How do you keep the scrollbar proportional?
+3. Fixed vs variable height data structures?
+4. How keep scrollbar proportional?
 5. `content-visibility: auto` vs JS virtualization?
-6. How to virtualize a table with sticky columns?
+6. Virtualize table with sticky columns?
 7. Interaction with infinite scroll?
-8. How does recycling pools (react-window) differ from fresh mounts?
+8. Recycling pools vs fresh mounts?
 
 ## Common mistakes
 
 | Mistake | Fix |
 | --- | --- |
-| Forgetting outer spacer height | Broken scrollbar |
-| Using margin for offset | Collapse / hard math — use transform or top |
-| setState on every scroll event | rAF batch |
+| No outer spacer height | Broken scrollbar |
+| Margin for offset | Prefer `transform` / `top` |
+| setState every scroll event | rAF batch |
 | Index as key with reorder | Stable ids |
-| Measuring during render | Refs + RO after paint |
-| Ignoring container padding | Off-by-padding scroll math |
+| Measure during render | Refs + RO after paint |
 
 ## Trade-offs
 
 | Choice | Pros | Cons |
 | --- | --- | --- |
-| Fixed height | Simple O(1) index math | Inflexible UI |
-| Dynamic measure | Real content heights | Jank risk; complex |
+| Fixed height | O(1) index math | Inflexible UI |
+| Dynamic measure | Real heights | Jank / complexity |
 | Library (TanStack Virtual) | Production-ready | Must explain internals |
-| CSS `content-visibility` | Tiny code | Weaker control; browser support nuances |
+| CSS `content-visibility` | Tiny code | Weaker control |
 
-**Interview close:** “Total height = N × rowHeight; only mount `[start, end)` positioned at `start * rowHeight`. Overscan hides fetch/paint latency.”
+**Interview close:** “Total height = N × rowHeight; mount `[start, end)` at `start * rowHeight`. Overscan hides paint latency.”
 
 ## Related
 
-- [Infinite scroll](/machine-coding/03-infinite-scroll)
-- [Optimized table](/machine-coding/08-optimized-table)
-- Browser cost: [Optimization](/browser/09-optimization)
+- [Infinite scroll](/machine-coding/03-infinite-scroll) · [Optimized table](/machine-coding/08-optimized-table)

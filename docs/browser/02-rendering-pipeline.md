@@ -1,241 +1,659 @@
 # Rendering Pipeline
 
-From bytes to pixels: **parse → style → layout → paint → composite**. Interviewers expect you to know which DOM/CSS changes dirties which stage, and why that maps to “layout thrashing” vs “cheap opacity animation.”
+This chapter teaches how a browser turns network bytes into pixels on your screen, from scratch. You do not need to already know DOM, CSSOM, “reflow,” compositing, or layers. By the end you should be able to walk **HTML/CSS → trees → layout → paint → composite**, explain **what each stage produces**, and predict **which kinds of changes make the browser redo which work**.
 
-Related: [JS Rendering](/javascript/20-rendering) · [CSS Internals](/browser/04-css-internals) · [Optimization](/browser/09-optimization) · [React reconciliation](/react/02-reconciliation)
+Related: [Browser Architecture](/browser/01-architecture) · [CSS Internals](/browser/04-css-internals) · [JS Rendering](/javascript/20-rendering) · [Browser Event Loop](/browser/03-event-loop) · [Networking](/browser/05-networking)
 
-## End-to-end pipeline
+---
+
+## 1. The goal in one sentence
+
+> Given HTML, CSS, images, and fonts, produce a bitmap (or GPU frames) that matches the designer’s intent — and keep updating it when the user scrolls, types, or your JS changes the page.
+
+That journey is the **rendering pipeline**.
+
+A useful analogy: a print shop.
+
+1. **Parse** — read the manuscript (HTML) and the style guide (CSS)
+2. **Decide what is visible** — build a “what to print” list (render tree)
+3. **Layout** — measure every box: where it sits, how wide/tall
+4. **Paint** — decide colors, text glyphs, borders (record drawing commands)
+5. **Composite** — layer the sheets and photograph the final page for the screen
 
 ```mermaid
 flowchart TB
-  HTML[HTML bytes] --> DOM[DOM Tree]
-  CSS[CSS bytes] --> CSSOM[CSSOM]
-  DOM --> RenderTree[Render / Frame Tree]
-  CSSOM --> RenderTree
-  RenderTree --> Layout[Layout / Reflow]
-  Layout --> Paint[Paint / Record display items]
-  Paint --> Layers[Layerization]
-  Layers --> Raster[Raster tiles]
-  Raster --> Composite[Composite to screen]
+  HTML["HTML bytes"] --> DOM["DOM tree"]
+  CSS["CSS bytes"] --> CSSOM["CSSOM"]
+  DOM --> RT["Render tree<br/>(visible boxes)"]
+  CSSOM --> RT
+  RT --> Layout["Layout / reflow<br/>(geometry)"]
+  Layout --> Paint["Paint<br/>(display items)"]
+  Paint --> Layers["Layerize"]
+  Layers --> Raster["Raster tiles"]
+  Raster --> Composite["Composite to screen"]
 ```
 
-| Stage | Input | Output | Invalidated by |
-| --- | --- | --- | --- |
-| Parse | HTML/CSS | DOM + CSSOM | Document mutation / stylesheet load |
-| Style | DOM + CSSOM | Computed styles | Class/style changes, media queries |
-| Layout | Render tree | Geometry (box model) | Size/position/font/content affecting flow |
-| Paint | Layout boxes | Display item list | Color, visibility, box-shadow, etc. |
-| Composite | Layers | Frame | Transform, opacity, filter (often) |
+You will learn each box slowly.
 
-**Critical path framing:** Time-to-First-Paint / LCP often blocked by CSS in `<head>`, fonts, and large images — not only JS. See [Networking](/browser/05-networking).
+---
 
-## DOM, CSSOM, render tree
+## 2. Parsing HTML → the DOM
 
-- **DOM:** structure + content. `display: none` nodes exist in DOM but are **excluded** from render tree.
-- **CSSOM:** cascade-resolved rules; blocking stylesheets delay first render.
-- **Render tree (Blink: LayoutObject / Fragment tree):** visible boxes only. Pseudo-elements appear here, not in DOM.
+### 2.1 What “parse” means
+
+**Parsing** means: take a stream of characters and build a structured tree the rest of the engine understands.
+
+HTML is not “a string forever.” After parsing, you get the **Document Object Model (DOM)** — a tree of nodes: elements, text, comments, etc.
+
+```html
+<!doctype html>
+<html>
+  <body>
+    <h1 id="title">Hello</h1>
+    <p class="lead">Welcome</p>
+  </body>
+</html>
+```
+
+Conceptually:
+
+```mermaid
+flowchart TB
+  Doc["Document"] --> HTML["html"]
+  HTML --> Body["body"]
+  Body --> H1["h1#title"]
+  Body --> P["p.lead"]
+  H1 --> T1["text: Hello"]
+  P --> T2["text: Welcome"]
+```
+
+### 2.2 Slow-motion: what the parser does
+
+1. Read bytes (decoded as characters using the document encoding).
+2. Tokenize: recognize `<div>`, `</div>`, text, attributes.
+3. Build nodes and attach them into a tree.
+4. When a `<script>` without `async`/`defer` appears, parsing may **pause** so classic scripts can run and maybe `document.write` more HTML.
+5. A **preload scanner** may look ahead in the raw bytes for `src` / `href` and start fetching early — even while the main parser is blocked on a script.
+
+```html
+<!-- Classic blocking script: parser waits -->
+<script src="/config.js"></script>
+
+<!-- Deferred: download in parallel, run after document parsed -->
+<script defer src="/app.js"></script>
+
+<!-- Module scripts defer by default -->
+<script type="module" src="/main.js"></script>
+```
+
+Plain language:
+
+> The DOM is the browser’s **live structured copy** of the document. When JS does `document.createElement` or sets `innerHTML`, it is editing this tree.
 
 ```ts
-// Forced synchronous layout — anti-pattern interview classic
-function badReadWriteLoop(els: HTMLElement[]): void {
-  for (const el of els) {
-    el.style.width = '100px'          // write → dirties layout
-    void el.offsetHeight              // read → forces layout NOW
-  }
+const title = document.querySelector("#title")
+title!.textContent = "Hello again" // mutates the DOM; may dirty later pipeline stages
+```
+
+---
+
+## 3. Parsing CSS → the CSSOM
+
+### 3.1 Why CSS is not “just text”
+
+CSS must become something the engine can query quickly: for each element, **which rules apply**, and what the **computed** values are.
+
+That structured result is often called the **CSSOM** (CSS Object Model) in teaching materials — think “the browser’s stylesheet data structures,” not only the `document.styleSheets` API.
+
+```css
+body {
+  margin: 0;
+  font-family: system-ui, sans-serif;
 }
 
+.lead {
+  color: #333;
+  font-size: 1.125rem;
+}
+```
+
+### 3.2 Why stylesheets can block first paint
+
+Until the browser knows styles, painting would risk a **FOUC** (flash of unstyled content) — content appears naked, then jumps when CSS arrives.
+
+So for normal stylesheets in the head, browsers typically **delay first render** until important CSS is available (details vary; treat “CSS in critical path blocks first paint” as the practical rule).
+
+```html
+<head>
+  <link rel="stylesheet" href="/app.css" />
+  <!-- First paint usually waits for this CSS (and fonts may delay text) -->
+</head>
+```
+
+Networking and waterfalls: [Networking](/browser/05-networking).
+
+### 3.3 Style calculation (matching + cascade)
+
+For each element (roughly):
+
+1. Find candidate rules (selector matching)
+2. Resolve conflicts via the **cascade** (origin, layers, specificity, order — taught in [CSS Internals](/browser/04-css-internals))
+3. Apply **inheritance** where appropriate
+4. Produce **computed styles** (the used-for-layout values after resolving keywords, variables, etc.)
+
+```mermaid
+flowchart LR
+  Change["Class / attribute / stylesheet change"] --> Dirty["Mark style dirty"]
+  Dirty --> Match["Match selectors"]
+  Match --> Cascade["Cascade + inherit"]
+  Cascade --> Computed["Computed style"]
+```
+
+---
+
+## 4. The render tree — “what will actually be drawn”
+
+### 4.1 DOM ∪ CSS ≠ always visible
+
+Some DOM nodes do not produce visual boxes:
+
+- `display: none` — removed from the visual tree (still in the DOM)
+- Certain metadata elements (`<script>`, `<head>` contents) — not painted as boxes
+
+The engine builds a **render tree** (Blink talks about layout objects / fragments; teaching name: render tree): **visible boxes only**, with styles attached.
+
+Pseudo-elements (`::before`, `::after`) can appear in the render tree even though they are not real DOM elements.
+
+```css
+.hidden {
+  display: none; /* in DOM, not in render tree */
+}
+
+.invisible {
+  visibility: hidden; /* still occupies layout space; box exists */
+}
+```
+
+| Declaration | In DOM? | In render tree? | Takes layout space? |
+| --- | --- | --- | --- |
+| `display: none` | Yes | No | No |
+| `visibility: hidden` | Yes | Yes | Yes |
+| `opacity: 0` | Yes | Yes | Yes |
+
+### 4.2 Analogy
+
+DOM = full cast list including people off-stage.  
+Render tree = people who will appear on camera for this shot.
+
+---
+
+## 5. Layout (also called reflow)
+
+### 5.1 Plain-language definition
+
+**Layout** answers:
+
+> For every box, what are its **size** and **position** on the page (in CSS pixels)?
+
+Inputs: render tree + containing blocks + formatting context rules (block flow, flex, grid, tables…).  
+Output: geometry — x, y, width, height (and related fragment info).
+
+Analogy: after you know who is on stage, layout places the furniture.
+
+### 5.2 Box model reminder (just enough)
+
+Each box has content, padding, border, margin. `box-sizing` changes whether `width` includes padding/border. Deep dive in [CSS Internals](/browser/04-css-internals).
+
+```css
+.card {
+  box-sizing: border-box;
+  width: 320px;
+  padding: 16px;
+  border: 1px solid #ccc;
+}
+```
+
+### 5.3 What makes layout expensive
+
+Layout can be:
+
+- **Local** — one subtree if containment / isolation allows
+- **Global** — large parts of the document when percentages, flex, or document flow couple boxes together
+
+Things that commonly force layout work:
+
+- Changing width/height, margins, fonts, text content
+- Adding/removing DOM nodes in normal flow
+- Resizing the viewport
+- Reading geometry after writes (see §9)
+
+```ts
+el.style.width = "50%"
+// Layout needed before the browser knows pixel width
+```
+
+### 5.4 Slow-motion layout of a simple page
+
+```html
+<div class="row">
+  <div class="col">A</div>
+  <div class="col">B</div>
+</div>
+```
+
+```css
+.row {
+  display: flex;
+  gap: 8px;
+}
+.col {
+  flex: 1;
+  padding: 12px;
+}
+```
+
+1. Viewport width known (e.g. 800px).
+2. `.row` is a flex container; content box width computed.
+3. Each `.col` gets a share of free space (`flex: 1`).
+4. Padding reduces content area inside each column.
+5. Text “A” / “B” sized with font metrics; may grow height.
+6. Row height becomes max of column heights (default align-items).
+
+That is layout: **constraints in → used pixel geometry out**.
+
+---
+
+## 6. Paint
+
+### 6.1 Plain-language definition
+
+**Paint** answers:
+
+> Given geometry, what **drawing commands** are needed — text glyphs, backgrounds, borders, shadows, images?
+
+Paint does not always mean “immediately fill pixels.” Modern engines often **record** a list of display items (“draw rectangle here,” “draw text there”), then rasterize later.
+
+Analogy: layout places picture frames; paint writes instructions for what goes inside each frame.
+
+### 6.2 What typically dirties paint (but not always layout)
+
+- `color`, `background-color`
+- `visibility` (still laid out)
+- `box-shadow`, `outline` (engine-dependent edge cases exist)
+- Image decoding finishing
+
+Changing `background-color` usually does **not** change geometry → skip full layout, still repaint.
+
+### 6.3 Paint order and stacking
+
+Painting respects stacking contexts and layers (z-index, opacity, transforms…). Details: [CSS Internals](/browser/04-css-internals). Pipeline takeaway: paint records are ordered so overlapping content composites correctly later.
+
+---
+
+## 7. Layers, raster, and composite
+
+### 7.1 Why layers exist
+
+If every tiny color change redrew the entire page from scratch on the CPU every frame, scrolling and animations would die.
+
+Engines promote some content into **layers** (compositor layers) that can be:
+
+- Rasterized into **tiles** (bitmaps)
+- Moved / faded by the **compositor** / GPU without re-layout or re-recording all paint
+
+```mermaid
+flowchart TB
+  Paint["Paint records"] --> Layerize["Decide layers"]
+  Layerize --> Raster["Raster tiles<br/>(CPU/GPU)"]
+  Raster --> Composite["Composite layers → frame"]
+  Composite --> Screen["Screen"]
+```
+
+### 7.2 Compositor-friendly changes
+
+Often (not a hard guarantee for every edge case):
+
+| Change | Typical pipeline cost |
+| --- | --- |
+| `transform: translate/scale/rotate` on a layer | Composite (cheap) |
+| `opacity` | Composite (cheap) |
+| `width` / `left` / `top` (non-transform) | Layout + paint + composite |
+| `color` | Paint + composite |
+| font-size | Layout + paint + composite |
+
+```css
+/* Prefer for animations when possible */
+.ball {
+  transform: translateX(0);
+  transition: transform 200ms linear;
+}
+.ball.moved {
+  transform: translateX(120px);
+}
+```
+
+```css
+/* More expensive pattern */
+.ball-slow {
+  position: relative;
+  left: 0;
+  transition: left 200ms linear;
+}
+.ball-slow.moved {
+  left: 120px; /* layout-ish positioning */
+}
+```
+
+### 7.3 Connection to architecture
+
+The **main thread** often does style/layout/paint recording. The **compositor thread** can update transforms/opacity for existing layers while the main thread is busy — which is why a stuck page can sometimes still scroll. See [Architecture](/browser/01-architecture).
+
+---
+
+## 8. One frame, end to end
+
+At ~60Hz, you have ~16.7ms per frame (more on high-refresh screens). A simplified frame:
+
+```mermaid
+sequenceDiagram
+  participant Loop as Event loop
+  participant Main as Main thread
+  participant Comp as Compositor / GPU
+  Loop->>Main: Run JS tasks / rAF
+  Main->>Main: Style
+  Main->>Main: Layout
+  Main->>Main: Paint record
+  Main->>Comp: Commit layer tree
+  Comp->>Comp: Raster / composite
+  Comp->>Comp: Present frame
+```
+
+Where this sits among tasks and microtasks: [Browser Event Loop](/browser/03-event-loop) · [JS Event Loop](/javascript/10-event-loop).
+
+`requestAnimationFrame` callbacks run **before** the browser paints that frame — ideal place for visual updates.
+
+```ts
+const el = document.querySelector(".ball") as HTMLElement
+let x = 0
+
+function tick() {
+  x += 2
+  el.style.transform = `translateX(${x}px)`
+  requestAnimationFrame(tick)
+}
+
+requestAnimationFrame(tick)
+```
+
+---
+
+## 9. What dirties what — the table you want memorized
+
+| You change… | Style | Layout | Paint | Composite |
+| --- | --- | --- | --- | --- |
+| Class that only changes `color` | ✓ | | ✓ | ✓ |
+| Text content / font-size | ✓ | ✓ | ✓ | ✓ |
+| `width` / `height` / margin | ✓ | ✓ | ✓ | ✓ |
+| `transform` / `opacity` (promoted) | ✓* | | | ✓ |
+| Add/remove node in flow | ✓ | ✓ | ✓ | ✓ |
+| Scroll (composited) | | | | ✓ (often) |
+
+\*Style may still invalidate; the *point* is you often avoid layout and heavy paint.
+
+Engines optimize; treat the table as a **mental model**, not a contractual API.
+
+---
+
+## 10. Forced synchronous layout (“layout thrashing”)
+
+### 10.1 The bug pattern
+
+Browsers are smart: they **batch** layout until they need geometry or until the next frame.
+
+If your JS:
+
+1. Writes styles
+2. Immediately **reads** geometry (`offsetHeight`, `getBoundingClientRect`, …)
+3. Writes again
+4. Reads again
+
+…the browser must **flush layout immediately** on each read. That is **forced synchronous layout**, a.k.a. layout thrashing.
+
+```ts
+function thrash(els: HTMLElement[]): void {
+  for (const el of els) {
+    el.style.width = "100px" // write — dirties layout
+    void el.offsetHeight // read — FORCES layout now
+  }
+}
+```
+
+### 10.2 The fix pattern — batch writes, then read
+
+```ts
 function batched(els: HTMLElement[]): void {
-  for (const el of els) el.style.width = '100px' // writes
-  // browser layouts once before next read / frame
+  for (const el of els) {
+    el.style.width = "100px" // writes only
+  }
+  // one layout flush for all
   const heights = els.map((el) => el.offsetHeight)
   void heights
 }
 ```
 
-Geometry getters that flush layout: `offset*`, `client*`, `scroll*`, `getComputedStyle` (sometimes), `getBoundingClientRect`.
+### 10.3 Geometry getters that commonly flush
 
-## Style recalc
+- `offsetTop`, `offsetLeft`, `offsetWidth`, `offsetHeight`
+- `clientTop`, `clientLeft`, `clientWidth`, `clientHeight`
+- `scrollTop`, `scrollLeft`, `scrollWidth`, `scrollHeight`
+- `getBoundingClientRect()`
+- `getComputedStyle(...)` in many cases when layout-dependent values are needed
 
-Matching selectors is roughly **O(elements × matching cost)**. Right-to-left selector engines mean `.nav li a` is costlier than `.nav-link`. `:nth-child` and complex combinators amplify work.
+```ts
+// Interleaved read/write — avoid in hot loops
+el.style.height = "200px"
+const h = el.getBoundingClientRect().height
+el.style.marginTop = `${h / 2}px`
+```
+
+Prefer measuring once, or use `ResizeObserver` for reactions to size changes without polling in a read/write loop.
+
+```ts
+const ro = new ResizeObserver((entries) => {
+  for (const entry of entries) {
+    const box = entry.contentBoxSize[0]
+    if (!box) continue
+    // schedule work; avoid immediately forcing more sync layout freely
+    console.log(box.inlineSize, box.blockSize)
+  }
+})
+ro.observe(document.querySelector(".card")!)
+```
+
+---
+
+## 11. Containment — limiting the blast radius
+
+CSS **containment** tells the browser a subtree is independent for layout/style/paint:
+
+```css
+.card {
+  contain: layout style paint;
+}
+```
+
+Plain language:
+
+> “Changes inside this card should not force you to relayout the whole page.”
+
+This is an optimization hint with real semantics — misuse can break visible overflow. Use when you understand the trade-off (component libraries, virtualized lists, widgets).
+
+Related performance mindset: [JS Rendering](/javascript/20-rendering).
+
+---
+
+## 12. Images, fonts, and the pipeline
+
+### 12.1 Images
+
+- May paint a placeholder first
+- When decoded, often **repaint** the image box (size may also change if intrinsic size affects layout — width/height attributes help avoid layout shift)
+
+```html
+<img src="/hero.jpg" width="1200" height="600" alt="Product" />
+```
+
+### 12.2 Fonts
+
+Web fonts can cause:
+
+- **FOIT** — invisible text until font loads
+- **FOUT** — fallback font then swap
+
+Font load can trigger **relayout** when metrics differ. `font-display` and size metrics (`size-adjust`, fallback tuning) matter for CLS (cumulative layout shift).
+
+```css
+@font-face {
+  font-family: "Display";
+  src: url("/display.woff2") format("woff2");
+  font-display: swap;
+}
+```
+
+---
+
+## 13. Critical rendering path (CRP)
+
+The **critical rendering path** is the minimum work to first useful paint:
+
+1. Download HTML
+2. Parse DOM
+3. Download + parse critical CSS
+4. Build render tree
+5. Layout
+6. Paint / composite
+
+Anything that lengthens those steps delays first paint / LCP:
+
+- Giant blocking CSS
+- Blocking scripts in `<head>` without care
+- Slow fonts
+- Huge hero images without priority hints
 
 ```mermaid
 flowchart LR
-  Change[Class / attribute change] --> Dirty[Dirty style on subtree]
-  Dirty --> Match[Selector matching]
-  Match --> Cascade[Cascade + inheritance]
-  Cascade --> Computed[ComputedStyle map]
+  HTML["HTML"] --> DOM
+  CSS["Critical CSS"] --> CSSOM
+  DOM --> RT["Render tree"]
+  CSSOM --> RT
+  RT --> L["Layout"]
+  L --> P["Paint"]
 ```
 
-**Containment** (`contain: layout style paint`) limits invalidation fan-out — senior-level optimization signal.
+See resource hints and waterfalls in [Networking](/browser/05-networking).
 
-## Layout (reflow)
+---
 
-Layout assigns **used values** (px) for boxes. Block/inline, flex, grid each have different algorithms. Percentage heights, tables, and intrinsic sizing (`min-content`) are expensive.
+## 14. Worked example — classify three updates
 
 ```ts
-// ResizeObserver: layout-aware without polling geometry in rAF incorrectly
-const ro = new ResizeObserver((entries) => {
-  for (const e of entries) {
-    const { inlineSize, blockSize } = e.contentBoxSize[0]!
-    // schedule work — do not force sync layout inside freely
-    console.log(inlineSize, blockSize)
-  }
-})
-ro.observe(document.querySelector('#root')!)
+const box = document.querySelector(".box") as HTMLElement
+
+// A
+box.style.backgroundColor = "navy"
+
+// B
+box.style.width = "50%"
+
+// C
+box.style.transform = "translateY(8px)"
 ```
 
-**Reflow vs repaint:** changing `width` → layout + paint + composite; changing `color` → paint (+ maybe composite); changing `transform` → often composite only.
+Walkthrough:
 
-## Paint & layers
+| Update | You dirtied primarily… | Why |
+| --- | --- | --- |
+| A | Paint (+ composite) | Color ≠ geometry |
+| B | Layout → paint → composite | Width changes box size; descendants may shift |
+| C | Composite (ideally) | Transform on its own layer often skips layout |
 
-Paint records drawing commands (text, backgrounds, borders). Browser promotes some nodes to **compositor layers** (own texture) when beneficial: video, canvas, 3D transforms, `will-change`, overlapping stacking contexts.
+If you then read `box.offsetHeight` after B, you **force** the layout flush immediately instead of waiting for the frame.
 
-```mermaid
-flowchart TB
-  subgraph Main["Main thread"]
-    L[Layout]
-    P[Paint records]
-  end
-  subgraph Comp["Compositor"]
-    T[Tiles]
-    C[Composite]
-  end
-  L --> P --> T --> C
+---
+
+## 15. Debugging with DevTools (practical)
+
+In Chrome Performance / Rendering tools you will see:
+
+- **Recalculate Style**
+- **Layout**
+- **Paint**
+- **Composite Layers**
+
+Purple layout bars in a performance trace after every mousemove often mean thrashing or hover styles that invalidate large trees.
+
+Layers panel helps see unexpected layer explosions (each layer costs memory).
+
+---
+
+## 16. How JS frameworks fit (lightly)
+
+React/Vue/Svelte do not replace this pipeline. They **produce DOM updates**; the browser still styles, lays out, paints, composites.
+
+Framework “reconciliation” decides *which DOM nodes change*. The cost of those changes still follows §9. Related: [JS Rendering](/javascript/20-rendering).
+
+```ts
+// Framework or vanilla — same browser rules
+element.classList.add("open") // may style + layout depending on CSS
 ```
 
-Too many layers → memory + upload cost (“layer explosion”). Too few → scrolling/animation hits main thread.
-
-## Composite-only properties (rule of thumb)
-
-Prefer animating: `transform`, `opacity` (and sometimes `filter`). Avoid animating: `top/left`, `width/height`, `margin`, `border-width` (layout).
-
-```css
-/* compositor-friendly */
-.card {
-  transition: transform 200ms, opacity 200ms;
-}
-.card:hover {
-  transform: translateY(-4px);
-  opacity: 0.95;
-}
-```
-
-## Pixel pipeline vs React
-
-React’s commit phase mutates the DOM → browser pipeline runs. Concurrent React ([Fiber](/react/01-fiber), [Concurrent](/react/04-concurrent)) can interrupt JS work, but **once DOM is committed**, style/layout still belong to the browser. Virtual DOM ≠ skipping layout.
+---
 
 ## Interview Questions
 
-**Q1. Explain reflow vs repaint.**  
-Reflow/layout recalculates geometry. Repaint/raster updates pixels for visual properties without necessarily changing geometry. Composite merges layers. A reflow usually implies subsequent paint.
+### Q1. Walk from HTML bytes to pixels.
+**Expected:** Parse DOM + CSSOM → render tree → layout → paint → raster/composite.  
+**Common wrong:** “The browser just paints the HTML string.”  
+**Follow-ups:** Where do `display: none` nodes go? (DOM yes, render tree no.)
 
-**Q2. Why does reading `offsetHeight` after writes cause jank?**  
-Writes dirty layout; the read requires up-to-date geometry → browser flushes pending style+layout synchronously on the main thread mid-JS.
+### Q2. Reflow vs repaint?
+**Expected:** Reflow/layout recalculates geometry; repaint redraws visuals without necessarily changing layout. Transform/opacity often skip to composite.  
+**Common wrong:** “They are the same.”  
+**Follow-ups:** Does changing `color` reflow? (Usually no.)
 
-**Q3. Does `display: none` trigger layout for that subtree?**  
-Removing from render tree can dirty ancestors; the hidden subtree is not laid out while `none`. Toggling it forces style+layout when shown — prefer `visibility`/`content-visibility`/`hidden` attribute patterns when appropriate.
+### Q3. What is layout thrashing?
+**Expected:** Interleaving DOM/style writes with geometry reads forces repeated synchronous layout.  
+**Common wrong:** “Any `querySelector` thrashing.”  
+**Follow-ups:** Name APIs that flush layout. How do you fix it?
 
-**Q4. What does `will-change: transform` do?**  
-Hints the engine to promote a layer early. Overuse wastes GPU memory. Prefer applying shortly before animation and removing after.
+### Q4. Why animate `transform` instead of `left`?
+**Expected:** `transform` can often be handled by the compositor on a layer; `left` typically triggers layout.  
+**Common wrong:** “Because transform is newer CSS.”  
+**Follow-ups:** When might transform still be expensive? (Huge layers, filters, non-promoted elements.)
 
-**Q5. How does `content-visibility: auto` help?**  
-Skips rendering work for off-screen subtrees (with containment), improving both rendering CPU and sometimes Interaction to Next Paint. Needs correct sizing (`contain-intrinsic-size`) to avoid scroll jumps.
+### Q5. Why can CSS block first paint?
+**Expected:** Without CSS, first paint risks unstyled content; browsers wait for critical CSS to build correct render tree.  
+**Common wrong:** “CSS never blocks; only JS does.”  
+**Follow-ups:** How do scripts without async/defer affect parsing?
+
+### Q6. Main thread vs compositor in rendering?
+**Expected:** Main thread: JS, style, layout, paint record. Compositor: combine layers / present frames; can move layers independently sometimes.  
+**Common wrong:** “GPU runs JavaScript.”  
+**Follow-ups:** Link to [Architecture](/browser/01-architecture).
 
 ## Common Mistakes
 
-- Measuring layout in a tight loop interleaved with DOM writes.
-- Animating `left/top` instead of `transform`.
-- Using `*` or deep universal selectors in hot stylesheets.
-- Applying `will-change` on hundreds of nodes permanently.
-- Assuming CSS-in-JS runtime style injection is “free” — it dirties style like any stylesheet mutation.
-- Blaming React for “slow renders” when DevTools Performance shows **Recalculate Style / Layout** dominating after commit.
+- Reading `offsetHeight` inside a write loop.
+- Animating layout properties for 60fps UI.
+- Forgetting images without dimensions cause layout shift when they load.
+- Assuming `visibility: hidden` skips layout (it does not).
+- Exploding layer count with careless `will-change: transform` everywhere.
+- Blaming “React” for costs that are really layout from CSS/DOM volume.
 
-## Trade-offs
+## Trade-offs / Production Notes
 
-| Technique | Benefit | Cost |
-| --- | --- | --- |
-| Batch DOM reads/writes | Fewer forced layouts | Requires discipline / libraries |
-| Compositor animations | Smooth under load | Limited expressiveness |
-| Extra layers | Independent scroll/anim | VRAM, bandwidth |
-| CSS containment | Smaller invalidation | Authoring complexity; bugs if misused |
-| `content-visibility` | Big list perf | Scrollbar/size reserving |
-
-**Senior takeaway:** Map every UI change to **which pipeline stage it dirties**. That single habit answers most rendering interview follow-ups.
-
-## Deep dive — Style invalidation sets
-
-Engines track which properties dirty style vs layout vs paint. Class changes may invalidate sibling/subtree matches depending on selectors. Attribute selectors (`[data-x]`) and sibling combinators (`+`, `~`) expand invalidation sets. Prefer local class toggles on the node that changes.
-
-```ts
-// Prefer targeted class over style attribute thrash
-el.classList.add('is-open') // one invalidation path
-// vs
-el.style.height = `${n}px` // per-frame layout if animated poorly
-```
-
-## Deep dive — Layerization heuristics (Blink-shaped)
-
-Promotion triggers (non-exhaustive): 3D transform, `<video>`, `<canvas>`, scrolling layers, `will-change`, opacity animations, filters. Compositor thread then can scroll/animate without main. Cost: each layer has a backing store (memory ≈ pixels × DPR × 4 bytes).
-
-```mermaid
-flowchart LR
-  Paint[Paint] --> Decide{Needs own layer?}
-  Decide -->|yes| Own[GraphicsLayer]
-  Decide -->|no| Share[Paint into ancestor]
-  Own --> Upload[Upload textures]
-  Share --> Upload
-```
-
-## Deep dive — Fonts & FOIT/FOUT
-
-Font loads block text rendering depending on `font-display`. Swap reduces blank text but causes CLS if metrics differ — use `size-adjust` / fallback metric overrides. Preload only critical fonts ([Networking](/browser/05-networking), [Optimization](/browser/09-optimization)).
-
-## Extra Q&A
-
-**Q6. What is a stacking context vs a layer?**  
-Stacking context = paint order / z-index algorithm. Compositor layer = GPU texture unit. Related but not 1:1.
-
-**Q7. Does changing `background-color` reflow?**  
-No layout; paint (and possibly composite). Geometry unchanged.
-
-**Q8. Why does DevTools show purple “Layout” bars after React commit?**  
-DOM mutations → browser layout. React time ≠ layout time; profile both [React reconciliation](/react/02-reconciliation).
-
-**Q9. `offsetWidth` in a Web Worker?**  
-Impossible — no DOM. Measure on main or use `OffscreenCanvas` for canvas-only cases.
-
-**Q10. IntersectionObserver vs scroll layout reads?**  
-IO is async and engine-optimized; prefer it over scroll handlers that call `getBoundingClientRect` every frame.
-
-
-## Worked example — “accordion expand janks”
-
-Symptom: expand toggles `height: auto` animation. Pipeline: each frame layout. Fix: animate `grid-template-rows: 0fr → 1fr` or transform scaleY with care, or WAAPI on compositor props; measure Layout events disappear.
-
-```css
-.panel {
-  display: grid;
-  grid-template-rows: 0fr;
-  transition: grid-template-rows 200ms;
-}
-.panel.open { grid-template-rows: 1fr; }
-.panel > .inner { overflow: hidden; min-height: 0; }
-```
-
-## Display locks & `content-visibility`
-
-Browsers may skip rendering work for off-screen subtrees. Pair with `contain-intrinsic-size` to avoid scrollbar jumps. Great for long feeds ([Optimization](/browser/09-optimization), [Virtual list](/machine-coding/04-virtual-list)).
-
-## Paint holding / first contentful
-
-Engines may delay first paint until meaningful content (paint holding) — late fonts/CSS still dominate LCP. Critical CSS strategies must not ship megabytes inline.
-
-## Glossary
-
-| Term | Definition |
-| --- | --- |
-| Reflow | Layout recalculation |
-| Repaint | Updating pixels without geometry change |
-| Layer | Compositor texture candidate |
-| Invalidation | Marking dirty regions/stages |
-| Render object | Engine box tree node |
+- Measure with Performance traces; do not guess which stage dominates.
+- Prefer compositor-friendly animation for continuous motion; use layout changes for genuine reflow needs (expandable panels, etc.).
+- `content-visibility` / `contain` can help large documents — validate overflow and accessibility (find-in-page, focus).
+- Critical CSS inlining helps first paint; over-inlining hurts caching and HTML weight.
+- Related: [CSS Internals](/browser/04-css-internals) · [Networking](/browser/05-networking) · [JS Rendering](/javascript/20-rendering) · [Browser Event Loop](/browser/03-event-loop)

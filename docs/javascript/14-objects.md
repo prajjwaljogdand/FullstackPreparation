@@ -1,28 +1,140 @@
 # Objects
 
-Property descriptors, prototypes (brief), immutability (`freeze` / `seal` / `preventExtensions`), and deep clone — what seniors implement on whiteboards.
+This chapter teaches JavaScript objects from scratch. You do not need to already know property descriptors, `[[Get]]`/`[[Set]]`, or `Object.freeze`. By the end you should be able to explain **what a property really is**, **how reading and writing work under the hood**, **what freeze/seal/preventExtensions actually guarantee**, and **how to deep-clone (and when you should not)**.
 
-## Object model in one glance
+---
 
-An ordinary object is a collection of **properties**, each with a **descriptor**, plus an internal `[[Prototype]]` link.
+## 1. What is an object, in plain language?
+
+An **object** is a bag of named values (and, later, behavior). You create one with curly braces:
+
+```ts
+const user = {
+  name: "Ada",
+  age: 36,
+}
+```
+
+Read that as:
+
+> “There is a value called `user`. It has a property `name` whose current value is `"Ada"`, and a property `age` whose current value is `36`.”
+
+Important first facts:
+
+1. **Objects are mutable by default** — you can add, change, or delete properties later.
+2. **Objects are reference values** — assigning `user` to another variable does **not** copy the bag; both variables point at the same bag.
+3. **Property names are strings** (or Symbols). Even `obj[1]` uses the string key `"1"`.
+
+```ts
+const a = { x: 1 }
+const b = a
+b.x = 2
+console.log(a.x) // 2 — same object
+```
+
+```mermaid
+flowchart LR
+  aVar["variable a"] --> obj["{ x: 2 }"]
+  bVar["variable b"] --> obj
+```
+
+That “two names, one bag” idea is why clone and immutability matter later.
+
+---
+
+## 2. Creating and reading properties — the surface APIs
+
+### 2.1 Dot vs bracket
+
+```ts
+const book = { title: "Dune", year: 1965 }
+
+book.title          // "Dune"  — dot: fixed identifier
+book["title"]       // "Dune"  — bracket: expression / dynamic key
+book["ye" + "ar"]   // 1965
+```
+
+Use **dot** when the key is a known valid identifier. Use **brackets** when the key is computed, has spaces, or comes from a variable.
+
+### 2.2 Adding, changing, deleting
+
+```ts
+const o: Record<string, unknown> = {}
+o.color = "red"     // add
+o.color = "blue"    // change
+delete o.color      // remove (if allowed — see configurable later)
+```
+
+### 2.3 What “missing” means
+
+```ts
+const o = { a: 1 }
+o.b          // undefined — no such own property (or value is undefined)
+"b" in o     // false
+"a" in o     // true
+o.hasOwnProperty("a") // true (prefer Object.hasOwn in modern code)
+Object.hasOwn(o, "a") // true
+```
+
+`in` walks the **prototype chain**. `Object.hasOwn` only checks the object itself. Interviews care about that difference.
+
+---
+
+## 3. Properties are not just values — they have descriptors
+
+When you write `{ name: "Ada" }`, the engine stores more than `"Ada"`. Each property has a **property descriptor**: a small record of rules.
 
 ```ts
 const user = { name: "Ada" }
 Object.getOwnPropertyDescriptor(user, "name")
-// { value: "Ada", writable: true, enumerable: true, configurable: true }
+// {
+//   value: "Ada",
+//   writable: true,
+//   enumerable: true,
+//   configurable: true
+// }
 ```
+
+Plain language for the three flags:
+
+| Flag | Meaning in plain English |
+| --- | --- |
+| **writable** | Can I change the stored value with assignment? |
+| **enumerable** | Does this property show up in `for…in`, `Object.keys`, spreads? |
+| **configurable** | Can I delete it or change its descriptor later? |
 
 ```mermaid
 flowchart TB
-  obj["user object"] --> name["name: data property"]
-  obj --> proto["[[Prototype]] → Object.prototype"]
-  name --> desc["value / writable / enumerable / configurable"]
+  obj["user object"] --> name["property: name"]
+  name --> desc["descriptor"]
+  desc --> v["value: Ada"]
+  desc --> w["writable"]
+  desc --> e["enumerable"]
+  desc --> c["configurable"]
 ```
 
-## Data vs accessor descriptors
+Object literals set all three flags to **`true`**. That is why everyday objects feel flexible.
+
+---
+
+## 4. Data properties vs accessor properties
+
+There are **two shapes** of descriptor. You cannot mix them on one property.
+
+### 4.1 Data property (stores a value)
+
+Has: `value`, `writable`, `enumerable`, `configurable`.
+
+### 4.2 Accessor property (runs code on get/set)
+
+Has: `get`, `set`, `enumerable`, `configurable` — **no** `value` / `writable`.
 
 ```ts
-const person: { first: string; last: string; fullName?: string } = {
+const person: {
+  first: string
+  last: string
+  fullName?: string
+} = {
   first: "Grace",
   last: "Hopper",
 }
@@ -39,28 +151,56 @@ Object.defineProperty(person, "fullName", {
   enumerable: true,
   configurable: true,
 })
+
+person.fullName           // "Grace Hopper"
+person.fullName = "Ada Lovelace"
+person.first              // "Ada"
 ```
 
-| Field | Data property | Accessor |
-| --- | --- | --- |
-| `value` | ✓ | — |
-| `writable` | ✓ | — |
-| `get` / `set` | — | ✓ |
-| `enumerable` | both | both |
-| `configurable` | both | both |
+When you **read** `person.fullName`, the engine calls the getter. When you **write**, it calls the setter. There is no separate stored `fullName` string unless the setter creates one.
 
-Cannot mix `value`/`writable` with `get`/`set` on the same define call.
+```mermaid
+sequenceDiagram
+  participant Code
+  participant Obj as person
+  participant Getter as get fullName
+  Code->>Obj: read person.fullName
+  Obj->>Getter: call get()
+  Getter-->>Code: "Grace Hopper"
+```
 
-### Defaults when using `defineProperty`
+---
 
-If you omit flags, they default to **`false`** (unlike object literals where they default to `true`):
+## 5. `Object.defineProperty` — teaching the defaults trap
+
+You can create or rewrite a property with full control:
+
+```ts
+const o: Record<string, unknown> = {}
+Object.defineProperty(o, "id", {
+  value: 1,
+  writable: false,
+  enumerable: false,
+  configurable: false,
+})
+```
+
+**Critical interview fact:** if you omit flags in `defineProperty`, they default to **`false`** — unlike object literals.
 
 ```ts
 Object.defineProperty({}, "x", { value: 1 })
 // writable: false, enumerable: false, configurable: false
 ```
 
-## `enumerable` / `configurable` / `writable` effects
+That surprises people who expect “I only set the value; the rest should be like a normal property.”
+
+`Object.defineProperties` does several at once. `Object.create(proto, props)` creates an object with a chosen prototype and optional descriptors.
+
+---
+
+## 6. What each flag actually does (walkthrough)
+
+### 6.1 `enumerable: false` — hidden from most listings
 
 ```ts
 const o: Record<string, unknown> = {}
@@ -71,244 +211,478 @@ Object.defineProperty(o, "hidden", {
   configurable: true,
 })
 
-Object.keys(o)                    // []
-for (const k in o) { /* skips hidden */ }
-JSON.stringify(o)                 // "{}"  — non-enumerable skipped
-({ ...o })                        // {}    — spread uses enumerable own
-Object.assign({}, o)              // {}
+Object.keys(o)        // []
+JSON.stringify(o)     // "{}"
+;({ ...o })           // {}
+Object.assign({}, o)  // {}
+o.hidden              // 42 — still readable by name
 ```
 
-`configurable: false` locks the descriptor shape (can't delete; limited redefines). `writable: false` makes assignment fail in strict mode.
+Non-enumerable does **not** mean private. It means “do not list me in the common enumeration APIs.”
 
-## Property key kinds
+### 6.2 `writable: false` — assignment fails (or is ignored)
 
 ```ts
-const sym = Symbol("id")
-const o = {
-  a: 1,
-  [sym]: 2,
-  10: "n",
-}
-
-Object.keys(o)                  // string keys that are enumerable ("10","a") — order: integer-index then creation
-Object.getOwnPropertyNames(o)   // includes non-enumerable strings
-Object.getOwnPropertySymbols(o) // [sym]
-Reflect.ownKeys(o)              // names + symbols
+"use strict"
+const o = {}
+Object.defineProperty(o, "x", { value: 1, writable: false, configurable: true })
+o.x = 2 // TypeError in strict mode
 ```
 
-## Prototype lookup vs own properties
+In sloppy mode, the assignment may fail silently. Modules and modern code are strict — treat it as an error.
+
+### 6.3 `configurable: false` — locked structure
+
+Once `configurable` is `false`:
+
+- you generally cannot `delete` the property
+- you cannot flip most descriptor fields
+- for data properties you **can** still change `value` if `writable` is still `true`
+- you can set `writable` from `true` → `false`, but not back to `true`
 
 ```ts
-const proto = { x: 1 }
-const child = Object.create(proto)
-child.y = 2
-
-child.x           // 1 (inherited)
-Object.hasOwn(child, "x") // false
-"x" in child      // true (includes prototype)
-```
-
-Assignment usually sets an **own** data property (unless an inherited accessor setter exists). See [Prototype Chain](/javascript/07-prototype).
-
-## `Object.create` / `Object.assign` / spread
-
-```ts
-const base = { role: "user" as const }
-const u = Object.create(base, {
-  id: { value: 1, enumerable: true, writable: true, configurable: true },
+const o = {}
+Object.defineProperty(o, "locked", {
+  value: 1,
+  writable: true,
+  enumerable: true,
+  configurable: false,
 })
 
-const merged = Object.assign({}, base, { name: "Ada" })
-const merged2 = { ...base, name: "Ada" } // shallow; ignores symbols unless well-known handling
+o.locked = 2                 // ok while writable
+Object.defineProperty(o, "locked", { writable: false }) // allowed one-way
+// Object.defineProperty(o, "locked", { writable: true }) // TypeError
+delete o.locked              // fails
 ```
 
-`Object.assign` and spread copy **enumerable own** properties (spread also invokes getters). Nested objects remain shared references.
+---
 
-## Immutability APIs (shallow)
+## 7. How reading works: `[[Get]]`
+
+When you write `obj.prop` or `obj["prop"]`, the engine does not only look at `obj`. Spec-wise this is the internal operation **`[[Get]]`**.
+
+Simplified teaching algorithm:
+
+```mermaid
+flowchart TD
+  start["[[Get]] obj, key"] --> own{"Own property key?"}
+  own -->|yes, data| retV["Return value"]
+  own -->|yes, accessor| callG["Call getter, return result"]
+  own -->|no| proto{"[[Prototype]] null?"}
+  proto -->|yes| undef["Return undefined"]
+  proto -->|no| walk["[[Get]] on prototype"]
+  walk --> own
+```
+
+Walkthrough:
 
 ```ts
-const cfg = { host: "api", nested: { retries: 3 } }
+const proto = { greet() { return "hi" } }
+const obj = Object.create(proto)
+obj.name = "Ada"
 
-Object.preventExtensions(cfg) // can't add keys
-Object.seal(cfg)              // preventExtensions + configurable:false on existing
-Object.freeze(cfg)            // seal + writable:false on data props
-
-cfg.nested.retries = 5        // still mutates! shallow only
+obj.name   // own data property → "Ada"
+obj.greet  // not own → look on proto → function
+obj.missing // not found up the chain → undefined
 ```
 
-| API | Add props | Delete | Reconfigure | Change values |
+`Object.getPrototypeOf(obj)` returns the prototype. Almost every ordinary object eventually links to `Object.prototype`, then `null`.
+
+> [!NOTE]
+> Prototypes are covered in depth elsewhere. Here you only need: **missing own properties continue the search on `[[Prototype]]`**.
+
+---
+
+## 8. How writing works: `[[Set]]`
+
+Assignment `obj.prop = value` uses **`[[Set]]`**. The short teaching version:
+
+1. If `obj` has an **own accessor** with a `set`, call that setter and stop.
+2. If `obj` has an **own data** property:
+   - if `writable`, store the new value
+   - if not writable, fail (strict) / ignore (sloppy)
+3. If not own, walk the prototype chain:
+   - inherited **setter** → call it with `this = obj` (important!)
+   - inherited **non-writable data** → fail
+   - otherwise, usually **create a new own data property** on `obj` (shadowing)
+
+```ts
+const proto = {}
+Object.defineProperty(proto, "x", {
+  set(v: number) {
+    console.log("setter on proto", v)
+  },
+  get() {
+    return 0
+  },
+  configurable: true,
+  enumerable: true,
+})
+
+const obj = Object.create(proto)
+obj.x = 5 // runs proto's setter; does NOT put own data `x` unless setter does
+```
+
+Shadowing example (common interview):
+
+```ts
+const proto = { color: "blue" }
+const obj = Object.create(proto)
+obj.color = "red" // creates OWN "color" on obj
+obj.color         // "red"
+delete obj.color
+obj.color         // "blue" again — inherited
+```
+
+```mermaid
+sequenceDiagram
+  participant Code
+  participant Obj
+  participant Proto
+  Code->>Obj: obj.color = "red"
+  Obj->>Obj: no own color, proto has writable data
+  Obj->>Obj: create own color = red
+  Note over Obj,Proto: proto.color still "blue"
+```
+
+---
+
+## 9. Freezing the shape: `preventExtensions`, `seal`, `freeze`
+
+These three APIs restrict what you can do to an object. They are **shallow** — they affect one object, not nested ones.
+
+### 9.1 Why they exist
+
+Sometimes you want to say:
+
+- “Nobody may add new keys.”
+- “Nobody may add or delete keys.”
+- “Nobody may add, delete, or change values.”
+
+That is useful for constants, security-ish hardening, and catching accidental mutation in tests.
+
+### 9.2 `Object.preventExtensions(obj)`
+
+**Cannot add** new properties. Existing ones stay as they were (still writable/configurable unless you changed them).
+
+```ts
+const o: Record<string, unknown> = { a: 1 }
+Object.preventExtensions(o)
+o.a = 2        // ok
+o.b = 3        // TypeError in strict mode
+Object.isExtensible(o) // false
+```
+
+### 9.3 `Object.seal(obj)`
+
+Calls prevent-extensions **and** sets every **own** property’s `configurable` to `false`.
+
+Result:
+
+- no add
+- no delete
+- no reconfigure descriptors
+- **values can still change** if `writable: true`
+
+```ts
+const o = { a: 1 }
+Object.seal(o)
+o.a = 9        // ok
+delete o.a     // fails
+o.b = 2        // fails
+Object.isSealed(o) // true
+```
+
+### 9.4 `Object.freeze(obj)`
+
+Seal **plus** set every own data property `writable: false`. Accessors keep their getters/setters but cannot be reconfigured; setters can still run if present.
+
+```ts
+const o = { a: 1 }
+Object.freeze(o)
+o.a = 9        // fails
+Object.isFrozen(o) // true
+```
+
+### 9.5 Comparison table
+
+| | Add props | Delete props | Change values | Reconfigure |
 | --- | --- | --- | --- | --- |
-| preventExtensions | ✗ | ✓* | ✓* | ✓ |
-| seal | ✗ | ✗ | ✗ | ✓ |
-| freeze | ✗ | ✗ | ✗ | ✗ (data) |
+| Normal | yes | yes* | yes* | yes* |
+| `preventExtensions` | no | yes* | yes* | yes* |
+| `seal` | no | no | yes* | no |
+| `freeze` | no | no | no (data) | no |
 
-\*subject to existing configurability.
+\*subject to that property’s own `writable` / `configurable` flags.
 
-```ts
-Object.isExtensible(cfg)
-Object.isSealed(cfg)
-Object.isFrozen(cfg)
+```mermaid
+flowchart LR
+  N["normal"] --> PE["preventExtensions"]
+  PE --> S["seal"]
+  S --> F["freeze"]
 ```
 
-Deep freeze:
+### 9.6 Shallow trap — the classic gotcha
 
 ```ts
-function deepFreeze<T extends object>(obj: T): T {
-  const props = Reflect.ownKeys(obj)
-  for (const key of props) {
-    const value = (obj as Record<PropertyKey, unknown>)[key]
-    if (value && typeof value === "object") deepFreeze(value)
-  }
-  return Object.freeze(obj)
-}
-```
-
-Caveats: cycles need a `WeakSet`; doesn't freeze closures inside methods; breaks libraries that mutate configs.
-
-## Deep clone implementation
-
-Interviewers want you to discuss **JSON**, **`structuredClone`**, and a **hand-rolled** recursive clone — and when each fails.
-
-### Option A — `structuredClone` (prefer in modern runtimes)
-
-```ts
-const copy = structuredClone({
-  d: new Date(),
-  m: new Map([["a", 1]]),
-  s: new Set([1, 2]),
-  buf: new Uint8Array([1, 2]),
-  n: 1n,
+const state = Object.freeze({
+  user: { name: "Ada" },
 })
+
+state.user = { name: "Grace" } // fails — frozen top level
+state.user.name = "Grace"      // SUCCEEDS — nested object not frozen
 ```
 
-Fails on functions, DOM nodes, prototypes custom class instances (become plain objects / throw depending), and some host objects.
+`freeze` does **not** deep-freeze. If you need deep immutability, freeze recursively (careful with cycles) or use a library / immutable data structure.
 
-### Option B — JSON (lossy)
+---
+
+## 10. Deep clone from scratch — teaching, not just a snippet
+
+### 10.1 The problem
 
 ```ts
-JSON.parse(JSON.stringify(obj))
-// drops undefined, functions, symbols; Date → string; NaN/Infinity → null
+const original = {
+  name: "Ada",
+  tags: ["math", "cs"],
+  meta: { active: true },
+}
+
+const shallow = { ...original }
+shallow.tags.push("poetry")
+console.log(original.tags) // includes "poetry" — nested array shared!
 ```
 
-### Option C — Hand-rolled (classic interview)
+Spread / `Object.assign` copy **one level**. Nested objects and arrays are still shared references.
+
+A **deep clone** builds a new tree so nested values are independent.
+
+```mermaid
+flowchart TB
+  subgraph before ["Shallow copy"]
+    O1["original"] --> T1["tags array"]
+    S1["shallow"] --> T1
+  end
+  subgraph after ["Deep clone"]
+    O2["original"] --> T2["tags A"]
+    D2["clone"] --> T3["tags B copy"]
+  end
+```
+
+### 10.2 What “clone” must decide
+
+Before coding, list the hard cases:
+
+1. Primitives (`number`, `string`, `boolean`, `null`, `undefined`, `bigint`, `symbol`) — return as-is (symbols are unique; cloning identity is subtle).
+2. Arrays — new array, clone each element.
+3. Plain objects — new object, clone each enumerable own property (policy choice).
+4. `Date`, `Map`, `Set`, `RegExp`, `ArrayBuffer`, typed arrays — special constructors.
+5. Functions — usually **do not clone**; keep the same reference or refuse.
+6. Cycles — `const a = {}; a.self = a` — need a memo map.
+7. Prototype / descriptors / non-enumerable — JSON loses them; a serious clone may use `getOwnPropertyDescriptors`.
+
+### 10.3 Why `JSON.parse(JSON.stringify(x))` is a teaching anti-pattern
+
+It “works” for plain JSON-like data and fails for:
+
+- `undefined`, functions, symbols (dropped or broken)
+- `Date` → string
+- `Map`/`Set` → `{}`
+- `Infinity` / `NaN` → `null`
+- cycles → throw
+- prototypes / non-enumerable props → lost
+
+Use it only when you **intentionally** want JSON-shaped data.
+
+### 10.4 Structured clone (platform)
 
 ```ts
-function deepClone<T>(value: T, seen = new WeakMap<object, unknown>()): T {
-  if (value === null || typeof value !== "object") return value
+const clone = structuredClone(original)
+```
 
-  if (typeof value === "function") {
-    throw new Error("Cannot clone functions")
+Available in modern browsers and Node. Handles many built-ins and cycles. Still does **not** clone functions. Prefer this in real apps when available.
+
+### 10.5 Teaching implementation — recursive clone with cycle guard
+
+```ts
+function deepClone<T>(input: T, seen = new WeakMap<object, unknown>()): T {
+  // 1. Primitives and functions: return as-is
+  if (input === null || typeof input !== "object") {
+    return input
   }
 
-  const obj = value as object
-  if (seen.has(obj)) return seen.get(obj) as T
+  // 2. Cycles: if we already started cloning this object, reuse the clone
+  if (seen.has(input as object)) {
+    return seen.get(input as object) as T
+  }
 
-  if (value instanceof Date) return new Date(value) as T
-  if (value instanceof RegExp) return new RegExp(value.source, value.flags) as T
-
-  if (value instanceof Map) {
+  // 3. Built-ins with special identity
+  if (input instanceof Date) {
+    return new Date(input.getTime()) as T
+  }
+  if (input instanceof RegExp) {
+    return new RegExp(input.source, input.flags) as T
+  }
+  if (input instanceof Map) {
     const out = new Map()
-    seen.set(obj, out)
-    value.forEach((v, k) => out.set(deepClone(k, seen), deepClone(v, seen)))
+    seen.set(input, out)
+    input.forEach((v, k) => {
+      out.set(deepClone(k, seen), deepClone(v, seen))
+    })
     return out as T
   }
-
-  if (value instanceof Set) {
+  if (input instanceof Set) {
     const out = new Set()
-    seen.set(obj, out)
-    value.forEach((v) => out.add(deepClone(v, seen)))
+    seen.set(input, out)
+    input.forEach((v) => out.add(deepClone(v, seen)))
     return out as T
   }
 
-  if (ArrayBuffer.isView(value)) {
-    // TypedArray / DataView — copy underlying buffer slice
-    return new (value.constructor as { new (buf: ArrayBufferLike): T })(
-      value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength),
-    )
-  }
-
-  if (Array.isArray(value)) {
+  // 4. Arrays
+  if (Array.isArray(input)) {
     const out: unknown[] = []
-    seen.set(obj, out)
-    for (let i = 0; i < value.length; i++) out[i] = deepClone(value[i], seen)
+    seen.set(input, out)
+    for (let i = 0; i < input.length; i++) {
+      if (i in input) {
+        out[i] = deepClone(input[i], seen)
+      }
+    }
     return out as T
   }
 
-  // Plain object — preserve descriptor-ish via define (simplified: values only)
-  const proto = Object.getPrototypeOf(value)
+  // 5. Plain objects — preserve descriptor flags when possible
+  const proto = Object.getPrototypeOf(input)
   const out = Object.create(proto)
-  seen.set(obj, out)
-  for (const key of Reflect.ownKeys(value)) {
-    const desc = Object.getOwnPropertyDescriptor(value, key)!
-    if ("value" in desc) {
+  seen.set(input as object, out)
+
+  for (const key of Reflect.ownKeys(input as object)) {
+    const desc = Object.getOwnPropertyDescriptor(input as object, key)!
+    if (desc.get || desc.set) {
+      // Accessors: copy the descriptor (getters/setters shared by reference)
+      Object.defineProperty(out, key, desc)
+    } else {
       Object.defineProperty(out, key, {
         ...desc,
         value: deepClone(desc.value, seen),
       })
-    } else {
-      // accessors: copy descriptor as-is (shared getters) or throw — state choice
-      Object.defineProperty(out, key, desc)
     }
   }
+
   return out as T
 }
 ```
 
-```mermaid
-flowchart TD
-  start["deepClone(v)"] --> prim{"primitive / null?"}
-  prim -->|yes| ret["return v"]
-  prim -->|no| cycle{"seen.has(v)?"}
-  cycle -->|yes| retSeen["return cached"]
-  cycle -->|no| type{"Date / Map / Set / Array / Object"}
-  type --> recurse["allocate, cache, recurse children"]
-```
+Walk the algorithm out loud in an interview:
 
-**Talk track:** mention `WeakMap` for cycles, typed arrays, prototype preservation policy, and that production often uses `structuredClone` or Immer for immutable updates instead of general deep clone.
+1. Non-objects return immediately.
+2. `WeakMap` remembers “original → clone” so cycles do not recurse forever.
+3. Special-case types that JSON would destroy.
+4. For arrays/objects, create the shell **before** filling children (needed for cycles).
+5. Recurse into nested values.
 
-## `Object` static helpers worth memorizing
+### 10.6 Minimal interview version (if time is short)
 
 ```ts
-Object.keys / values / entries
-Object.fromEntries
-Object.hasOwn          // preferred over hasOwnProperty.call
-Object.getPrototypeOf / setPrototypeOf  // setPrototypeOf is slow / discouraged
-Object.groupBy         // modern grouping
+function deepCloneSimple<T>(value: T, seen = new WeakMap()): T {
+  if (value === null || typeof value !== "object") return value
+  if (seen.has(value as object)) return seen.get(value as object)
+
+  if (Array.isArray(value)) {
+    const arr: unknown[] = []
+    seen.set(value, arr)
+    value.forEach((item, i) => {
+      arr[i] = deepCloneSimple(item, seen)
+    })
+    return arr as T
+  }
+
+  const obj: Record<string | symbol, unknown> = {}
+  seen.set(value as object, obj)
+  for (const [k, v] of Object.entries(value as object)) {
+    obj[k] = deepCloneSimple(v, seen)
+  }
+  return obj as T
+}
 ```
+
+Mention what you skipped: Dates, Maps, descriptors, symbols, prototypes.
+
+---
+
+## 11. Related object APIs you will see next to these topics
+
+```ts
+Object.keys(o)              // enumerable own string keys
+Object.values(o)
+Object.entries(o)
+Object.fromEntries(entries)
+Object.assign(target, ...sources) // shallow copy into target
+Object.hasOwn(o, key)
+Reflect.ownKeys(o)         // strings + symbols, incl. non-enumerable
+```
+
+`for…in` enumerates enumerable keys along the prototype chain (usually skip with `Object.hasOwn` checks). Prefer `Object.keys` / `Object.entries` for own enumerable string keys.
+
+---
+
+## 12. Worked example — config object that must not grow
+
+```ts
+type Config = { apiUrl: string; retries: number }
+
+function hardenConfig(config: Config): Readonly<Config> {
+  // Shallow freeze is enough if all fields are primitives
+  return Object.freeze({ ...config })
+}
+
+const cfg = hardenConfig({ apiUrl: "/api", retries: 3 })
+// cfg.retries = 5  // TypeError at runtime; TS also complains with Readonly
+```
+
+If config gains nested objects, either deep-freeze or treat nested pieces as separately frozen modules.
+
+---
 
 ## Interview Questions
 
-**Q: Difference between `freeze`, `seal`, `preventExtensions`?**  
-Freeze: no add/delete/reconfigure/value change. Seal: no add/delete/reconfigure, values mutable. preventExtensions: no add only.
+### Q1. What is a property descriptor?
+**Expected:** Metadata for a property: for data props `value`/`writable`/`enumerable`/`configurable`; for accessors `get`/`set`/`enumerable`/`configurable`.  
+**Common wrong:** “Just the value of the property.”  
+**Follow-ups:** Defaults of `defineProperty` vs object literal?
 
-**Q: Why is `Object.freeze` insufficient for Redux-style immutability?**  
-Shallow; nested refs still mutate. Need deep freeze, structural sharing, or immutable libs.
+### Q2. Difference between `freeze`, `seal`, and `preventExtensions`?
+**Expected:** preventExtensions blocks adding; seal also makes props non-configurable (no delete); freeze also makes data props non-writable. All are shallow.  
+**Common wrong:** “`freeze` deep-freezes the whole tree.”  
 
-**Q: `for…in` vs `Object.keys`?**  
-`for…in` walks enumerable props including inherited. `Object.keys` — own enumerable strings only.
+### Q3. How does `obj.x` find a value?
+**Expected:** `[[Get]]`: own property first (value or getter), else walk `[[Prototype]]`, else `undefined`.  
+**Common wrong:** “Only looks at own keys.”  
 
-**Q: How do you deep clone with cycles?**  
-Track originals → clones in a `WeakMap`; on revisit return the mapped clone.
+### Q4. What happens on `obj.x = 1` if `x` only exists on the prototype?
+**Expected:** Usually creates an own property on `obj` (shadowing), unless an inherited setter runs or inherited data is non-writable.  
+**Common wrong:** “Always mutates the prototype.”  
 
-**Q: What does non-configurable mean?**  
-Can't delete property; can't change configurable/enumerable (and writable only false→false direction for data props); accessors locked.
+### Q5. Implement deep clone — what must you handle?
+**Expected:** Nested objects/arrays, cycles via a memo map, and preferably built-ins like `Date`/`Map`; note functions/`JSON` limits.  
+**Common wrong:** Only `JSON.parse(JSON.stringify(...))` with no caveats.  
 
-**Q: Spread vs `Object.assign`?**  
-Both shallow. Spread is expression syntax; triggers getters; doesn't copy prototype. Assign can target an existing object.
+### Q6. Is non-enumerable the same as private?
+**Expected:** No — still readable if you know the key; not true encapsulation (`#private` fields are different).  
 
 ## Common Mistakes
 
-- Expecting `freeze` to deep-freeze.
-- Using `JSON` clone and losing `Date` / `undefined` / `Map`.
-- Forgetting `WeakMap` → infinite recursion on cycles.
-- Cloning class instances into plain objects and wondering why methods/`instanceof` break.
-- Checking ownership with `obj.hasOwnProperty` without `.call` (shadowed method) — use `Object.hasOwn`.
-- Assuming `__proto__` is a normal key (legacy accessor on `Object.prototype`).
+- Assuming `Object.freeze` protects nested objects.
+- Using `defineProperty` and forgetting flags default to `false`.
+- Treating spread / `Object.assign` as a deep clone.
+- Using `JSON` clone for `Date`, `Map`, `undefined`, or cyclic graphs.
+- Confusing `in` (prototype chain) with `Object.hasOwn` (own only).
+- Believing non-enumerable properties cannot be read.
+- Forgetting assignment can **shadow** inherited properties instead of editing the prototype.
 
 ## Trade-offs / Production Notes
 
-- Prefer **immutable update patterns** (copy-on-write) over deep-cloning large graphs every render.
-- Config objects: freeze in production builds to catch accidental mutation early.
-- Don't `Object.setPrototypeOf` in hot paths — deopts.
-- Security: merging user JSON into objects (`__proto__` / `constructor.prototype`) → prototype pollution; use `Object.create(null)` or null-prototype merges.
-- Related: [Fundamentals](/javascript/01-fundamentals), [Prototype](/javascript/07-prototype), [Machine Coding](/javascript/23-machine-coding), [Memory](/javascript/12-memory).
+- Prefer **`structuredClone`** (or a maintained library) over hand-rolled deep clone in production.
+- `freeze` is useful for catching accidental mutation in tests and for constant config — not a security boundary against determined code.
+- For React state, prefer **immutable updates** (new objects) over mutating then freezing.
+- True privacy: use **closures** or **`#private` fields**, not `enumerable: false`.
+- Related: [Prototypes](/javascript/04-this-prototypes) (if present in your notes), [Arrays](/javascript/15-arrays), [TypeScript utility types](/typescript/) for `Readonly` / `ReadonlyDeep` patterns.

@@ -1,155 +1,250 @@
-# Build: Infinite Scroll
+# Infinite Scroll
 
-Paginated list that loads the next page when a sentinel enters the viewport.
+Load the next page when the user nears the end of a list. Core skills: **IntersectionObserver**, cursor/offset pagination, in-flight guards, and unmount safety.
 
 ## Requirements
 
-- Fetch pages: `{ items, nextCursor }`
-- Append pages; show loading row; stop at end
-- `IntersectionObserver` sentinel (not scroll math)
-- Cancel in-flight on unmount / key change
-- Error + retry; empty state
-- Deduplicate items by `id`
+### Functional
+
+- Initial page fetch on mount
+- When sentinel enters viewport → fetch next page
+- Append results; stop when `hasMore === false`
+- Show loading / error / retry UI
+- Optional: “Load more” fallback button
+
+### Non-functional
+
+- No duplicate page fetches (rapid scroll / IO spam)
+- Cancel or ignore stale responses on filter change
+- Keep prior items visible while loading
+
+### Clarify
+
+- Offset vs cursor pagination?
+- Upward infinite scroll (chat history)?
+- Combine with virtualization? → [Virtual list](/machine-coding/04-virtual-list)
 
 ## Architecture
 
 ```mermaid
 flowchart TB
-  L[List] --> I[Items]
-  L --> S[Sentinel]
-  S -->|intersecting| F[fetchNextPage]
-  F --> API
-  API --> L
+  List[Item list] --> Sentinel[Sentinel div]
+  Sentinel -->|IntersectionObserver| IO
+  IO -->|isIntersecting| Loader[loadMore]
+  Loader -->|guard inflight| API[fetchPage cursor]
+  API --> Append[append items + nextCursor]
 ```
 
-## Implementation
+```mermaid
+sequenceDiagram
+  participant U as User scroll
+  participant IO as Observer
+  participant H as Hook
+  participant API as API
+  U->>IO: sentinel visible
+  IO->>H: loadMore()
+  alt already loading or !hasMore
+    H-->>H: no-op
+  else
+    H->>API: GET ?cursor=
+    API-->>H: items, nextCursor
+    H->>H: setItems append
+  end
+```
+
+## Complete implementation
 
 ```tsx
-import {
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-} from 'react'
+// infinite-scroll.tsx
+import { useCallback, useEffect, useRef, useState } from 'react'
 
-type Item = { id: string; title: string }
+export type Page<T> = { items: T[]; nextCursor: string | null }
 
-type Page = {
-  items: Item[]
-  nextCursor: string | null
-}
+type Status = 'idle' | 'loading' | 'loadingMore' | 'error'
 
-async function fetchPage(cursor: string | null, signal: AbortSignal): Promise<Page> {
-  const url = cursor ? `/api/feed?cursor=${cursor}` : '/api/feed'
-  const res = await fetch(url, { signal })
-  if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  return res.json()
-}
+export function useInfiniteQuery<T>(opts: {
+  fetchPage: (cursor: string | null) => Promise<Page<T>>
+  queryKey: string
+  rootMargin?: string
+  enabled?: boolean
+}) {
+  const { fetchPage, queryKey, rootMargin = '200px', enabled = true } = opts
 
-export function InfiniteFeed() {
-  const [items, setItems] = useState<Item[]>([])
+  const [items, setItems] = useState<T[]>([])
   const [cursor, setCursor] = useState<string | null>(null)
   const [hasMore, setHasMore] = useState(true)
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const [status, setStatus] = useState<Status>('idle')
+  const [error, setError] = useState<Error | null>(null)
 
-  const seen = useRef(new Set<string>())
-  const loadingRef = useRef(false)
+  const inflight = useRef(false)
+  const reqId = useRef(0)
   const sentinelRef = useRef<HTMLDivElement | null>(null)
 
-  const loadMore = useCallback(async (reset = false) => {
-    if (loadingRef.current) return
-    if (!reset && !hasMore) return
-    loadingRef.current = true
-    setLoading(true)
-    setError(null)
-    const ac = new AbortController()
-    try {
-      const page = await fetchPage(reset ? null : cursor, ac.signal)
-      setItems((prev) => {
-        const base = reset ? [] : prev
-        if (reset) seen.current.clear()
-        const merged = [...base]
-        for (const item of page.items) {
-          if (seen.current.has(item.id)) continue
-          seen.current.add(item.id)
-          merged.push(item)
-        }
-        return merged
-      })
-      setCursor(page.nextCursor)
-      setHasMore(page.nextCursor != null)
-    } catch (e) {
-      if ((e as Error).name !== 'AbortError') {
-        setError((e as Error).message)
-      }
-    } finally {
-      loadingRef.current = false
-      setLoading(false)
-    }
-  }, [cursor, hasMore])
+  const load = useCallback(
+    async (mode: 'reset' | 'more') => {
+      if (!enabled) return
+      if (inflight.current) return
+      if (mode === 'more' && !hasMore) return
 
-  // initial load
+      inflight.current = true
+      const id = ++reqId.current
+      setStatus(mode === 'reset' ? 'loading' : 'loadingMore')
+      setError(null)
+
+      try {
+        const pageCursor = mode === 'reset' ? null : cursor
+        const page = await fetchPage(pageCursor)
+        if (id !== reqId.current) return
+
+        setItems((prev) => (mode === 'reset' ? page.items : [...prev, ...page.items]))
+        setCursor(page.nextCursor)
+        setHasMore(page.nextCursor != null)
+        setStatus('idle')
+      } catch (e) {
+        if (id !== reqId.current) return
+        setError(e instanceof Error ? e : new Error(String(e)))
+        setStatus('error')
+      } finally {
+        if (id === reqId.current) inflight.current = false
+      }
+    },
+    [cursor, enabled, fetchPage, hasMore],
+  )
+
   useEffect(() => {
-    void loadMore(true)
+    setItems([])
+    setCursor(null)
+    setHasMore(true)
+    setError(null)
+    inflight.current = false
+    void load('reset')
+    // reset only on queryKey
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [queryKey, enabled])
 
   useEffect(() => {
     const node = sentinelRef.current
-    if (!node) return
-    const io = new IntersectionObserver(
+    if (!node || !enabled) return
+
+    const obs = new IntersectionObserver(
       (entries) => {
-        if (entries.some((e) => e.isIntersecting)) void loadMore(false)
+        if (entries.some((e) => e.isIntersecting)) void load('more')
       },
-      { root: null, rootMargin: '200px', threshold: 0 }
+      { root: null, rootMargin, threshold: 0 },
     )
-    io.observe(node)
-    return () => io.disconnect()
-  }, [loadMore])
+    obs.observe(node)
+    return () => obs.disconnect()
+  }, [load, rootMargin, enabled, queryKey])
+
+  return {
+    items,
+    hasMore,
+    status,
+    error,
+    retry: () => void load(items.length === 0 ? 'reset' : 'more'),
+    sentinelRef,
+    isLoading: status === 'loading',
+    isLoadingMore: status === 'loadingMore',
+  }
+}
+
+type Post = { id: string; title: string }
+
+async function fetchPosts(cursor: string | null): Promise<Page<Post>> {
+  const url = new URL('/api/posts', window.location.origin)
+  if (cursor) url.searchParams.set('cursor', cursor)
+  url.searchParams.set('limit', '20')
+  const res = await fetch(url)
+  if (!res.ok) throw new Error('Failed to load')
+  return res.json()
+}
+
+export function InfinitePostList({ search }: { search: string }) {
+  const {
+    items,
+    hasMore,
+    isLoading,
+    isLoadingMore,
+    error,
+    retry,
+    sentinelRef,
+  } = useInfiniteQuery<Post>({
+    queryKey: `posts:${search}`,
+    fetchPage: fetchPosts,
+  })
+
+  if (isLoading) return <p>Loading…</p>
 
   return (
     <div>
       <ul>
-        {items.map((item) => (
-          <li key={item.id}>{item.title}</li>
+        {items.map((p) => (
+          <li key={p.id}>{p.title}</li>
         ))}
       </ul>
-
       {error && (
-        <p role="alert">
-          {error}{' '}
-          <button type="button" onClick={() => void loadMore(false)}>
+        <div>
+          <p>{error.message}</p>
+          <button type="button" onClick={retry}>
             Retry
           </button>
-        </p>
+        </div>
       )}
-
-      {!error && hasMore && (
-        <div ref={sentinelRef} aria-hidden style={{ height: 1 }} />
-      )}
-
-      {loading && <p>Loading…</p>}
-      {!loading && !hasMore && items.length === 0 && <p>No items</p>}
-      {!loading && !hasMore && items.length > 0 && <p>End of feed</p>}
+      {hasMore && !error && <div ref={sentinelRef} style={{ height: 1 }} aria-hidden />}
+      {isLoadingMore && <p>Loading more…</p>}
+      {!hasMore && items.length > 0 && <p>End of list</p>}
     </div>
   )
 }
 ```
 
+Prefer **cursors** for feeds (stable under inserts); offsets drift when rows appear at the top.
+
 ## Edge cases
 
 | Case | Handling |
 | --- | --- |
-| Fast scroll / double observe | `loadingRef` guard |
-| Duplicate ids across pages | `seen` set |
-| Filter change | Reset list + cursor + seen |
-| Short first page | `rootMargin` still triggers if sentinel visible |
+| Sentinel always visible (short page) | Loop with `inflight` until `hasMore` false or filled |
+| Fast filter typing | Bump `reqId` / change `queryKey`; ignore stale |
+| Unmount during fetch | `reqId` or `AbortController` |
+| Empty page with cursor | Cap loops / detect identical cursor |
+| Nested scroll root | Pass `root: scrollEl` |
+| Duplicate ids | Dedupe when merging |
+| Error mid-list | Keep items; retry at bottom |
 
-## Follow-up questions
+## Follow-up interview questions
 
-1. Integrate React Query `useInfiniteQuery`.
-2. Restore scroll position on back navigation.
-3. Bidirectional chat-style infinite scroll.
-4. Accessibility: announce newly loaded count via live region.
-5. Virtualize after 500+ DOM nodes.
+1. Cursor vs offset — trade-offs?
+2. Why IntersectionObserver over `scroll`?
+3. Combine with virtualization?
+4. How does `useInfiniteQuery` store pages?
+5. Preserve scroll when prepending (chat)?
+6. What is `rootMargin` for?
+7. Prevent page 1→2→3 waterfall on empty viewports?
+8. a11y: how do SRs learn about new items?
+
+## Common mistakes
+
+| Mistake | Fix |
+| --- | --- |
+| No in-flight lock | Duplicate pages |
+| Unthrottled scroll listener | Jank |
+| Index as key | Bugs on prepend |
+| Forgetting `disconnect` | Leaks |
+| Reset list without cursor | Wrong page |
+| Fetch in render | Infinite loops |
+
+## Trade-offs
+
+| Choice | Pros | Cons |
+| --- | --- | --- |
+| IO sentinel | Efficient | Nested roots tricky |
+| “Load more” button | Predictable a11y | Extra click |
+| Virtualize + infinite | Scales | Complex sync |
+| Auto-fill viewport | Good UX | Need loop guard |
+
+**Interview close:** “Observer near end → guarded fetch → append by cursor. Reset on filter; drop stale responses.”
+
+## Related
+
+- [Virtual list](/machine-coding/04-virtual-list) · [FE Feed](/frontend-system-design/01-feed)

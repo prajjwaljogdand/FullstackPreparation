@@ -6,22 +6,22 @@ Reorderable list with pointer events (or HTML5 DnD). Interviewers probe hit-test
 
 ### Functional
 
-- Drag an item; show placeholder / ghost
-- Drop reorders the list (`onReorder(from, to)`)
+- Drag an item; show placeholder / highlight
+- Drop reorders the list (`onReorder`)
 - Optional: drag between columns (kanban stretch)
-- Keyboard: Space/Enter to pick up, arrows to move, Space/Escape to drop/cancel
+- Keyboard: Alt+Arrow move (or Space pick-up / arrows / Space drop)
 
 ### Non-functional
 
-- No layout thrash; use transforms while dragging
-- Touch + mouse support
-- Announce moves to screen readers (`aria-live`)
+- Use transforms while dragging; avoid layout thrash
+- Touch + mouse (`touch-action: none` on handle)
+- Announce moves via `aria-live`
 
 ### Clarify
 
 - Free-form canvas vs list reorder?
 - Nested droppable zones?
-- Persistence / optimistic API?
+- Persist order to API?
 
 ## Architecture
 
@@ -30,20 +30,19 @@ stateDiagram-v2
   [*] --> Idle
   Idle --> Dragging: pointerdown on handle
   Dragging --> Dragging: pointermove update overIndex
-  Dragging --> Idle: pointerup commit reorder
+  Dragging --> Idle: pointerup commit
   Dragging --> Idle: Escape cancel
 ```
 
 ```mermaid
 flowchart TB
   Pointer[pointer events] --> State[dragIndex, overIndex]
-  State --> Preview[CSS transform ghost]
-  State --> List[Render with gap / placeholder]
+  State --> List[Render preview order]
   PointerUp --> Commit[arrayMove]
   Commit --> onReorder
 ```
 
-## Complete implementation (pointer reorder)
+## Complete implementation
 
 ```tsx
 // drag-drop-list.tsx
@@ -93,8 +92,7 @@ export function DragDropList<T>({
         reset()
         return
       }
-      const next = arrayMove(items, from, to)
-      onReorder(next)
+      onReorder(arrayMove(items, from, to))
       setLive(`Moved item to position ${to + 1} of ${items.length}`)
       reset()
     },
@@ -106,8 +104,7 @@ export function DragDropList<T>({
       const el = itemRefs.current[i]
       if (!el) continue
       const rect = el.getBoundingClientRect()
-      const mid = rect.top + rect.height / 2
-      if (clientY < mid) return i
+      if (clientY < rect.top + rect.height / 2) return i
     }
     return items.length - 1
   }
@@ -134,7 +131,6 @@ export function DragDropList<T>({
   }
 
   const onKeyDown = (index: number) => (e: KeyboardEvent) => {
-    // Simple pattern: Alt+Arrow moves without full drag mode
     if (e.altKey && e.key === 'ArrowDown' && index < items.length - 1) {
       e.preventDefault()
       commit(index, index + 1)
@@ -145,7 +141,6 @@ export function DragDropList<T>({
     }
   }
 
-  // Visual order while dragging
   const visual =
     dragIndex != null && overIndex != null
       ? arrayMove(items, dragIndex, overIndex)
@@ -164,13 +159,8 @@ export function DragDropList<T>({
         style={{ listStyle: 'none', padding: 0, margin: 0 }}
       >
         {visual.map((item, visualIndex) => {
-          // Map visual index back to original for drag handle identity
-          const originalIndex =
-            dragIndex != null && overIndex != null
-              ? items.findIndex((x) => getKey(x) === getKey(item))
-              : visualIndex
+          const originalIndex = items.findIndex((x) => getKey(x) === getKey(item))
           const isDragging = dragIndex === originalIndex
-
           return (
             <li
               key={getKey(item)}
@@ -180,7 +170,6 @@ export function DragDropList<T>({
               onKeyDown={onKeyDown(originalIndex)}
               style={{
                 display: 'flex',
-                alignItems: 'center',
                 gap: 8,
                 padding: '8px 12px',
                 marginBottom: 4,
@@ -193,7 +182,6 @@ export function DragDropList<T>({
               <button
                 type="button"
                 aria-label={`Drag handle for item ${visualIndex + 1}`}
-                aria-describedby={listId}
                 onPointerDown={onPointerDown(originalIndex)}
                 style={{ cursor: 'grab' }}
               >
@@ -207,8 +195,6 @@ export function DragDropList<T>({
     </>
   )
 }
-
-// ─── Demo ────────────────────────────────────────────────────────────
 
 export function ReorderDemo() {
   const [items, setItems] = useState([
@@ -229,16 +215,13 @@ export function ReorderDemo() {
 }
 ```
 
-### HTML5 DnD alternative (brief)
+### HTML5 DnD alternative
 
 ```tsx
 <div
   draggable
-  onDragStart={(e) => {
-    e.dataTransfer.setData('text/plain', String(index))
-    e.dataTransfer.effectAllowed = 'move'
-  }}
-  onDragOver={(e) => e.preventDefault()} // allow drop
+  onDragStart={(e) => e.dataTransfer.setData('text/plain', String(index))}
+  onDragOver={(e) => e.preventDefault()}
   onDrop={(e) => {
     const from = Number(e.dataTransfer.getData('text/plain'))
     onReorder(arrayMove(items, from, index))
@@ -246,54 +229,50 @@ export function ReorderDemo() {
 />
 ```
 
-HTML5 DnD is simpler but weaker on touch and styling the drag image.
-
 ## Edge cases
 
 | Case | Handling |
 | --- | --- |
-| Drop outside list | Cancel (`pointercancel` / leave) |
-| Empty list | No-op |
-| Scrollable container while dragging | Auto-scroll near edges (stretch) |
-| Nested interactive controls | Drag **handle** only — don’t make whole row `draggable` |
-| Touch callout / scroll | `touch-action: none` on handle |
-| Same index drop | No state update |
-| Concurrent React updates | Controlled `items` from parent |
+| Drop outside list | Cancel |
+| Scrollable container | Auto-scroll near edges (stretch) |
+| Nested buttons | Drag **handle** only |
+| Touch scroll vs drag | `touch-action: none` on handle |
+| Same index drop | No update |
+| Virtualized list + DnD | Hard — measure carefully |
 
 ## Follow-up interview questions
 
-1. Pointer events vs HTML5 DnD vs libraries (`dnd-kit`)?
-2. How do you implement kanban (multiple droppables)?
-3. How to avoid hit-testing every `pointermove` (spatial index)?
+1. Pointer vs HTML5 DnD vs `dnd-kit`?
+2. Kanban multiple droppables?
+3. Spatial index for hit-testing?
 4. Why `setPointerCapture`?
-5. How should virtualized lists handle DnD?
-6. Accessibility checklist for reorderable lists?
-7. How to persist order (fractional indices vs full rewrite)?
-8. Drag preview: clone vs transform original?
+5. Virtualized lists + DnD?
+6. a11y checklist for reorder?
+7. Persist order (fractional indices)?
+8. Drag preview strategies?
 
 ## Common mistakes
 
 | Mistake | Fix |
 | --- | --- |
-| Reordering DOM without updating state | Controlled list from React state |
-| Using index as React key | Stable ids |
-| Preventing `dragover` default forgotten | Drop never fires |
+| Reorder DOM without React state | Controlled `items` |
+| Index as key | Stable ids |
+| Forget `dragover` preventDefault | Drop never fires |
 | Whole-row drag breaks buttons | Dedicated handle |
 | No live region | SR users lost |
-| Mutating array in place | `arrayMove` copy |
+| Mutate array in place | Copy via `arrayMove` |
 
 ## Trade-offs
 
 | Choice | Pros | Cons |
 | --- | --- | --- |
 | Pointer + transform | Full control, touch OK | More code |
-| HTML5 DnD | Tiny API | Touch gaps, styling limits |
-| `dnd-kit` / Pragmatic DnD | Sensors, a11y, collision | Must justify dependency |
-| Optimistic reorder | Snappy | Needs rollback on API fail |
+| HTML5 DnD | Tiny API | Touch/styling limits |
+| Library | Sensors, a11y | Justify dependency |
+| Optimistic reorder | Snappy | Rollback on API fail |
 
-**Interview close:** “Track `dragIndex`/`overIndex`, preview with `arrayMove`, commit on pointerup. Handle-only dragging + live regions for a11y.”
+**Interview close:** “Track `dragIndex`/`overIndex`, preview with `arrayMove`, commit on pointerup. Handle-only + live regions.”
 
 ## Related
 
-- Lists: [Virtual list](/machine-coding/04-virtual-list)
-- Design systems: [FE Design System](/frontend-system-design/04-design-system)
+- [Virtual list](/machine-coding/04-virtual-list)

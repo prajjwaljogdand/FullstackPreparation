@@ -6,12 +6,12 @@ Messaging thread: message list, composer, optimistic send, stick-to-bottom scrol
 
 ### Functional
 
-- Render messages in chronological order
-- Composer: text + Send (Enter to send, Shift+Enter newline)
+- Chronological messages
+- Composer: Enter send, Shift+Enter newline
 - Optimistic append with `clientId`; reconcile on ack
 - Failed sends show retry
-- Auto-scroll to bottom when pinned; “New messages” when scrolled up
-- Optional: load older messages when scrolling to top
+- Auto-scroll when pinned; “New messages” when scrolled up
+- Optional: load older at top
 
 ### Non-functional
 
@@ -21,9 +21,7 @@ Messaging thread: message list, composer, optimistic send, stick-to-bottom scrol
 
 ### Clarify
 
-- WS vs polling?
-- Markdown / reactions / receipts?
-- Group vs 1:1?
+- WS vs polling? Markdown / receipts? Group vs 1:1?
 
 ## Architecture
 
@@ -64,7 +62,6 @@ sequenceDiagram
 // chat-ui.tsx
 import {
   useCallback,
-  useEffect,
   useLayoutEffect,
   useRef,
   useState,
@@ -76,7 +73,7 @@ import {
 export type MsgStatus = 'pending' | 'sent' | 'failed'
 
 export type ChatMessage = {
-  id: string // clientId until ack; then server id
+  id: string
   clientId: string
   text: string
   author: 'me' | 'them'
@@ -103,13 +100,7 @@ async function apiSend(
 
 const NEAR_BOTTOM_PX = 80
 
-export function ChatUI({
-  initial = [],
-  meLabel = 'You',
-}: {
-  initial?: ChatMessage[]
-  meLabel?: string
-}) {
+export function ChatUI({ initial = [], meLabel = 'You' }: { initial?: ChatMessage[]; meLabel?: string }) {
   const [messages, setMessages] = useState<ChatMessage[]>(initial)
   const [draft, setDraft] = useState('')
   const [pinned, setPinned] = useState(true)
@@ -125,57 +116,30 @@ export function ChatUI({
 
   const onScroll = (e: UIEvent<HTMLDivElement>) => {
     const el = e.currentTarget
-    const distance = el.scrollHeight - el.scrollTop - el.clientHeight
-    const near = distance < NEAR_BOTTOM_PX
+    const near = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_PX
     setPinned(near)
     if (near) setUnseen(0)
   }
 
-  // Stick to bottom on new messages when pinned
   useLayoutEffect(() => {
-    if (pinned) {
-      scrollToBottom(messages.length <= 1 ? 'auto' : 'smooth')
-    }
+    if (pinned) scrollToBottom(messages.length <= 1 ? 'auto' : 'smooth')
   }, [messages, pinned, scrollToBottom])
-
-  const upsertIncoming = useCallback(
-    (msg: ChatMessage) => {
-      setMessages((prev) => {
-        if (prev.some((m) => m.id === msg.id || m.clientId === msg.clientId)) {
-          return prev.map((m) =>
-            m.clientId === msg.clientId || m.id === msg.id ? { ...m, ...msg } : m,
-          )
-        }
-        return [...prev, msg]
-      })
-      if (!pinned && msg.author === 'them') {
-        setUnseen((n) => n + 1)
-      }
-    },
-    [pinned],
-  )
-
-  // Fake peer / WS hook point
-  useEffect(() => {
-    const t = setInterval(() => {
-      // demo only — replace with WebSocket onmessage
-    }, 60_000)
-    return () => clearInterval(t)
-  }, [])
 
   const send = async (text: string) => {
     const trimmed = text.trim()
     if (!trimmed) return
     const clientId = cid()
-    const optimistic: ChatMessage = {
-      id: clientId,
-      clientId,
-      text: trimmed,
-      author: 'me',
-      createdAt: Date.now(),
-      status: 'pending',
-    }
-    setMessages((prev) => [...prev, optimistic])
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: clientId,
+        clientId,
+        text: trimmed,
+        author: 'me',
+        createdAt: Date.now(),
+        status: 'pending',
+      },
+    ])
     setDraft('')
     setPinned(true)
     setUnseen(0)
@@ -218,29 +182,21 @@ export function ChatUI({
     }
   }
 
-  /** Call before prepending history; restores visual position */
   const prependHistory = (older: ChatMessage[]) => {
     const el = scrollerRef.current
     if (el) prevHeight.current = el.scrollHeight
     setMessages((prev) => {
       const seen = new Set(prev.map((m) => m.id))
-      const merged = [...older.filter((m) => !seen.has(m.id)), ...prev]
-      return merged
+      return [...older.filter((m) => !seen.has(m.id)), ...prev]
     })
   }
 
   useLayoutEffect(() => {
     const el = scrollerRef.current
     if (!el || prevHeight.current === 0) return
-    const delta = el.scrollHeight - prevHeight.current
-    el.scrollTop += delta
+    el.scrollTop += el.scrollHeight - prevHeight.current
     prevHeight.current = 0
   }, [messages])
-
-  const onSubmit = (e: FormEvent) => {
-    e.preventDefault()
-    void send(draft)
-  }
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -250,28 +206,17 @@ export function ChatUI({
   }
 
   return (
-    <div
-      style={{
-        display: 'flex',
-        flexDirection: 'column',
-        height: 480,
-        border: '1px solid #ccc',
-        maxWidth: 420,
-      }}
-    >
+    <div style={{ display: 'flex', flexDirection: 'column', height: 480, border: '1px solid #ccc', maxWidth: 420 }}>
       <header style={{ padding: 8, borderBottom: '1px solid #eee' }}>Chat</header>
-
       <div style={{ position: 'relative', flex: 1, minHeight: 0 }}>
         <div
           ref={scrollerRef}
           role="log"
           aria-live="polite"
-          aria-relevant="additions"
           onScroll={onScroll}
           style={{ height: '100%', overflow: 'auto', padding: 8 }}
         >
           <button type="button" onClick={() => prependHistory([])}>
-            {/* wire to fetch older */}
             Load older
           </button>
           {messages.map((m) => (
@@ -311,7 +256,6 @@ export function ChatUI({
           ))}
           <div ref={bottomRef} />
         </div>
-
         {unseen > 0 && (
           <button
             type="button"
@@ -320,19 +264,19 @@ export function ChatUI({
               setUnseen(0)
               scrollToBottom()
             }}
-            style={{
-              position: 'absolute',
-              bottom: 8,
-              left: '50%',
-              transform: 'translateX(-50%)',
-            }}
+            style={{ position: 'absolute', bottom: 8, left: '50%', transform: 'translateX(-50%)' }}
           >
-            {unseen} new message{unseen > 1 ? 's' : ''}
+            {unseen} new
           </button>
         )}
       </div>
-
-      <form onSubmit={onSubmit} style={{ display: 'flex', gap: 8, padding: 8 }}>
+      <form
+        onSubmit={(e: FormEvent) => {
+          e.preventDefault()
+          void send(draft)
+        }}
+        style={{ display: 'flex', gap: 8, padding: 8 }}
+      >
         <label className="sr-only" htmlFor="chat-draft">
           Message
         </label>
@@ -342,7 +286,6 @@ export function ChatUI({
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={onKeyDown}
-          placeholder="Message"
           style={{ flex: 1, resize: 'none' }}
         />
         <button type="submit" disabled={!draft.trim()}>
@@ -352,18 +295,6 @@ export function ChatUI({
     </div>
   )
 }
-
-// Expose for WS integration demos
-export type { ChatMessage as Message }
-```
-
-### Realtime merge sketch
-
-```ts
-socket.onmessage = (ev) => {
-  const msg = JSON.parse(ev.data) as ChatMessage
-  upsertIncoming({ ...msg, status: 'sent' })
-}
 ```
 
 ## Edge cases
@@ -371,47 +302,44 @@ socket.onmessage = (ev) => {
 | Case | Handling |
 | --- | --- |
 | Double ack (HTTP + WS) | Dedupe by `clientId` / server `id` |
-| User scrolled up + own send | Usually force pin on send |
+| Own send while scrolled up | Usually force pin |
 | Prepend history | Adjust `scrollTop` by height delta |
-| Empty send / whitespace | Ignore |
-| Very long message | CSS wrap; server max length |
-| Reconnect backlog | Resume cursor; merge sorted |
-| `aria-live` spam | polite + don’t announce every keystroke |
+| Empty / whitespace send | Ignore |
+| Clock skew ordering | Server timestamp + tie-break id |
+| `aria-live` spam | polite; don’t announce drafts |
 
 ## Follow-up interview questions
 
-1. How do you preserve scroll when loading older messages?
-2. Optimistic UI rollback patterns?
-3. Virtualize a chat list — what’s hard about stick-to-bottom?
-4. Exactly-once delivery vs at-least-once on WS?
-5. Where does typing indicator live (ephemeral)?
-6. How to order messages with clock skew?
-7. Offline queue design?
-8. E2E encryption impact on search/preview?
+1. Preserve scroll when loading older?
+2. Optimistic rollback patterns?
+3. Virtualize chat + stick-to-bottom?
+4. At-least-once WS delivery?
+5. Typing indicator ownership?
+6. Offline send queue?
+7. E2E encryption impact?
+8. How to merge realtime into React Query cache?
 
 ## Common mistakes
 
 | Mistake | Fix |
 | --- | --- |
-| Key = array index | Use `clientId` |
-| Auto-scroll always | Respect `pinned` |
-| Replace entire list on WS event | Upsert |
-| Blocking send button until ack only | Allow queue; show pending |
+| Key = index | Use `clientId` |
+| Always auto-scroll | Respect `pinned` |
+| Replace list on WS | Upsert |
 | Prepend without scroll adjust | Jump |
-| Putting draft in global store | Local state |
+| Draft in global store | Local state |
 
 ## Trade-offs
 
 | Choice | Pros | Cons |
 | --- | --- | --- |
-| Optimistic send | Feels instant | Reconcile complexity |
-| Virtualize | Long history OK | Sticky bottom harder |
+| Optimistic send | Instant feel | Reconcile complexity |
+| Virtualize | Long history | Sticky bottom harder |
 | WS + HTTP send | Reliable ack | Dedupe required |
-| Polling | Simple | Latency / cost |
+| Polling | Simple | Latency |
 
-**Interview close:** “Optimistic pending row keyed by `clientId`, reconcile on ack, stick-to-bottom when pinned, height-delta when prepending history.”
+**Interview close:** “Optimistic pending keyed by `clientId`, reconcile on ack, stick-to-bottom when pinned, height-delta when prepending.”
 
 ## Related
 
-- [FE Chat](/frontend-system-design/03-chat) · [BE Chat](/backend-system-design/03-chat)
-- [Infinite scroll](/machine-coding/03-infinite-scroll) · [Virtual list](/machine-coding/04-virtual-list)
+- [FE Chat](/frontend-system-design/03-chat) · [Infinite scroll](/machine-coding/03-infinite-scroll)
