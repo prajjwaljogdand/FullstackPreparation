@@ -6,6 +6,8 @@ export default withMermaid(
     title: 'Senior Full-Stack Interview Handbook',
     description:
       'Interview-dense handbook for mid → senior full-stack roles: JS, Browser, TS, React, Next.js, Node, Backend, System Design, Coding.',
+    // Project Pages URL: https://prajjwaljogdand.github.io/FullstackPreparation/
+    base: '/FullstackPreparation/',
     cleanUrls: true,
     lastUpdated: true,
     themeConfig: {
