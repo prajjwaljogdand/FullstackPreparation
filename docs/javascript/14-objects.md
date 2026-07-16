@@ -685,4 +685,4 @@ If config gains nested objects, either deep-freeze or treat nested pieces as sep
 - `freeze` is useful for catching accidental mutation in tests and for constant config — not a security boundary against determined code.
 - For React state, prefer **immutable updates** (new objects) over mutating then freezing.
 - True privacy: use **closures** or **`#private` fields**, not `enumerable: false`.
-- Related: [Prototypes](/javascript/04-this-prototypes) (if present in your notes), [Arrays](/javascript/15-arrays), [TypeScript utility types](/typescript/) for `Readonly` / `ReadonlyDeep` patterns.
+- Related: [Prototypes](/javascript/07-prototype), [this](/javascript/06-this), [Arrays](/javascript/15-arrays), [TypeScript utility types](/typescript/05-utility-types) for `Readonly` / `Partial` patterns.

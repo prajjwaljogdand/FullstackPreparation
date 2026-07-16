@@ -2,7 +2,7 @@
 
 This chapter teaches browser memory from scratch. You do not need to already know heaps, mark-and-sweep, or “detached DOM.” By the end you should be able to explain **where objects live**, **what keeps them alive**, **how garbage collection roughly works**, **why SPAs leak memory**, and **how to think with DevTools**.
 
-Related: [Execution Context](/javascript/02-execution-context) · [Closures](/javascript/06-closures) · [Event Loop](/browser/03-event-loop) · [Rendering](/browser/02-rendering-pipeline)
+Related: [Execution Context](/javascript/02-execution-context) · [Closures](/javascript/05-closures) · [Event Loop](/browser/03-event-loop) · [Rendering](/browser/02-rendering-pipeline)
 
 ---
 
@@ -484,7 +484,7 @@ No immortal array. Listener removed. Node can become unreachable.
 ### Q7. How can closures cause leaks?
 **Expected:** A long-lived function retains outer-scope bindings, keeping large objects alive.  
 **Common wrong:** “Closures always leak.”  
-**Follow-ups:** Relate to [Closures](/javascript/06-closures).
+**Follow-ups:** Relate to [Closures](/javascript/05-closures).
 
 ### Q8. WeakMap vs Map for caching?
 **Expected:** WeakMap keys don’t keep key objects alive; Map does. WeakMap only allows object keys and isn’t iterable the same way.  
@@ -553,4 +553,4 @@ export function mountFeature(root: HTMLElement) {
 - Component teardown checklists for third-party widgets.
 - Virtualize huge lists so you don’t keep thousands of DOM nodes.
 - Prefer `AbortController` for listener lifetime when multiple listeners share a feature mount.
-- Related: [Optimization](/browser/09-optimization), [Closures](/javascript/06-closures), [Event Loop](/browser/03-event-loop).
+- Related: [Optimization](/browser/09-optimization), [Closures](/javascript/05-closures), [Event Loop](/browser/03-event-loop).

@@ -603,4 +603,4 @@ Prompt: “Implement `map`, then `filter`, then show sum with `reduce`.”
 - Native methods are battle-tested and optimized; reimplement for interviews/learning, not production replacements.
 - For large lists, prefer single-pass logic (one `reduce` / one loop) over many intermediate arrays if profiling shows cost.
 - TypeScript: annotate accumulator types in `reduce` or inference gets `{}` / `unknown` wrong.
-- Related: [Objects](/javascript/14-objects), [Iterators](/javascript/) if covered, machine coding [Infinite scroll](/machine-coding/03-infinite-scroll).
+- Related: [Objects](/javascript/14-objects), [Functions](/javascript/09-functions), machine coding [Infinite scroll](/machine-coding/03-infinite-scroll).

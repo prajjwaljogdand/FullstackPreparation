@@ -458,4 +458,4 @@ Even better for “visible characters”: `Intl.Segmenter` with `grapheme`.
 - Use `Intl.Segmenter` when “character” means UX, not encoding.
 - Prefer `replaceAll` / `matchAll` over subtle `/g` state.
 - For security-sensitive HTML, use vetted escaping libraries or framework text bindings — not string concat.
-- Related: [Numbers](/javascript/17-numbers), [Arrays](/javascript/15-arrays) (`split`/`join`), [DOM / XSS](/browser/) if present in your notes.
+- Related: [Numbers](/javascript/17-numbers), [Arrays](/javascript/15-arrays) (`split`/`join`), [Browser security / XSS](/browser/06-security).
